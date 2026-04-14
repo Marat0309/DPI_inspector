@@ -8,6 +8,8 @@ Requires: pip install aioquic
 """
 
 import asyncio
+import argparse
+import json
 import socket
 import ssl
 import subprocess
@@ -29,7 +31,8 @@ except ImportError:
 
 # ── Colors ────────────────────────────────────────────────────
 class Colors:
-    def __init__(self, enabled: bool = True):
+    def __init__(self, enabled: bool = True, silent: bool = False):
+        self.silent = silent
         if enabled:
             self.R    = '\033[0;31m'
             self.G    = '\033[0;32m'
@@ -70,13 +73,17 @@ def print_row(c: Colors, sc: Score, num: int, label: str, detail: str, verdict: 
            'fail': c.fail_sym(), 'info': c.info_sym()}.get(verdict, c.info_sym())
     sc.add(verdict)
     detail = (detail[:34] + '…') if len(detail) > 35 else detail
-    print(f"  {c.DIM}[{num:2d}]{c.NC}  {c.W}{label:<22}{c.NC}  {c.DIM}→{c.NC}  {detail:<36}  {sym}")
+    if not c.silent:
+        print(f"  {c.DIM}[{num:2d}]{c.NC}  {c.W}{label:<22}{c.NC}  {c.DIM}→{c.NC}  {detail:<36}  {sym}")
 
 
 def div(c: Colors):
-    print(f"  {c.DIM}{'─' * 63}{c.NC}")
+    if not c.silent:
+        print(f"  {c.DIM}{'─' * 63}{c.NC}")
 
 def header(c: Colors, text: str):
+    if c.silent:
+        return
     pad = '═' * (55 - len(text))
     print(f"\n{c.C}  ══ {text} {c.DIM}{pad}{c.NC}")
     print()
@@ -184,10 +191,11 @@ def probe_raw_udp(c: Colors, sc: Score, host: str, port: int):
 
 
 async def probe_quic_handshake(c: Colors, sc: Score, host: str, port: int,
-                                sni: str, timeout: int):
+                                sni: str, timeout: int, client: ProbeProtocol | None | bool = None):
     """Full QUIC handshake with target SNI"""
     num = 3
-    client = await _connect(host, port, sni, timeout)
+    if client is None:
+        client = await _connect(host, port, sni, timeout)
     if client is None:
         print_row(c, sc, num, "QUIC handshake", f"timeout ({timeout}s) — no response", "fail")
         return
@@ -207,10 +215,11 @@ async def probe_quic_handshake(c: Colors, sc: Score, host: str, port: int,
 
 
 async def probe_certificate(c: Colors, sc: Score, host: str, port: int,
-                             sni: str, timeout: int):
+                             sni: str, timeout: int, client: ProbeProtocol | None | bool = None):
     """Extract and evaluate TLS cert from QUIC handshake"""
     num = 4
-    client = await _connect(host, port, sni, timeout)
+    if client is None:
+        client = await _connect(host, port, sni, timeout)
     if not client or client is False:
         print_row(c, sc, num, "TLS certificate", "could not connect", "fail")
         return
@@ -364,34 +373,47 @@ def print_summary(c: Colors, sc: Score):
 
 # ── Main ──────────────────────────────────────────────────────
 async def main():
-    args = [a for a in sys.argv[1:] if not a.startswith('--')]
-    flags = [a for a in sys.argv[1:] if a.startswith('--')]
+    ap = argparse.ArgumentParser(description="UDP/QUIC probe for DPI masquerade checks")
+    ap.add_argument("host")
+    ap.add_argument("port", type=int)
+    ap.add_argument("sni", nargs="?")
+    ap.add_argument("--timeout", type=int, default=5)
+    ap.add_argument("--no-color", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--host-is-ip", action="store_true")   # accepted for dpi_check.sh compatibility
+    ap.add_argument("--sni-explicit", action="store_true") # accepted for dpi_check.sh compatibility
+    ap.add_argument("--debug", action="store_true")         # accepted for dpi_check.sh compatibility
+    args = ap.parse_args()
 
-    if len(args) < 2:
-        print(f"Usage: {sys.argv[0]} <host> <port> [sni] [--no-color]")
-        sys.exit(1)
+    host = args.host
+    port = args.port
+    sni = args.sni or host
+    timeout = args.timeout
 
-    host    = args[0]
-    port    = int(args[1])
-    sni     = args[2] if len(args) > 2 else host
-    timeout = 5
-
-    use_color = '--no-color' not in flags
-    c  = Colors(use_color and sys.stdout.isatty() or use_color)
+    use_color = not args.no_color
+    c  = Colors(use_color and sys.stdout.isatty(), silent=args.json)
     sc = Score()
 
-    header(c, "UDP / QUIC CHECKS")
+    if not args.json:
+        header(c, "UDP / QUIC CHECKS")
 
+    warm_client = await _connect(host, port, sni, timeout)
     await probe_udp_reachability(c, sc, host, port)
     probe_raw_udp(c, sc, host, port)
-    await probe_quic_handshake(c, sc, host, port, sni, timeout)
-    await probe_certificate(c, sc, host, port, sni, timeout)
+    await probe_quic_handshake(c, sc, host, port, sni, timeout, warm_client)
+    await probe_certificate(c, sc, host, port, sni, timeout, warm_client)
     await probe_mismatched_sni(c, sc, host, port, timeout)
     await probe_no_sni(c, sc, host, port, timeout)
     await probe_http3(c, sc, host, port, sni, timeout)
     await probe_port_hopping(c, sc, host, timeout)
 
-    print_summary(c, sc)
+    if args.json:
+        print(json.dumps({
+            "target": {"host": host, "port": port, "sni": sni, "mode": "udp"},
+            "score": {"pts": sc.pts, "max": sc.max, "pct": sc.pct()},
+        }, ensure_ascii=False))
+    else:
+        print_summary(c, sc)
 
 
 if __name__ == "__main__":
