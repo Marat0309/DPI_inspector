@@ -101,8 +101,10 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
     h2 = "/ h2" in _obs(findings, "tls_handshake")
     h3 = mode == "udp" or "HTTP/3" in _obs(findings, "http3")
     public_cert = _sev(findings, "tls_cert", "quic_cert") == "ok"
+    cert_non_public = _sev(findings, "tls_cert", "quic_cert") == "notice"
     web_ok = _sev(findings, "http_fallback") in {"ok", "notice"}
     strong_web = _sev(findings, "http_fallback") == "ok" and _sev(findings, "random_path") == "ok"
+    random_path_risk = _sev(findings, "random_path") == "risk"
     headers_strong = _sev(findings, "headers") == "ok"
     headers_some = _sev(findings, "headers") in {"ok", "notice"}
     ws_exposed = _sev(findings, "ws_leak") == "risk"
@@ -134,6 +136,8 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
         _add(scores, "ordinary_web_front", 0.24, "ordinary HTTPS fallback page")
     if public_cert:
         _add(scores, "ordinary_web_front", 0.16, "public CA certificate")
+    elif cert_non_public:
+        _add(scores, "ordinary_web_front", -0.08, against="non-public or unusual certificate profile")
     if modern_tls:
         _add(scores, "ordinary_web_front", 0.10, "modern TLS stack")
     elif usable_tls:
@@ -153,15 +157,19 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if strong_web and connect_rejected and not ws_exposed and not grpc_exposed and public_cert:
         _add(scores, "ordinary_web_front", 0.14, "combined normal-web behavior across path, CONNECT, and transport checks")
     if foreign_open:
-        _add(scores, "ordinary_web_front", -0.07, against="answers to foreign SNI")
+        _add(scores, "ordinary_web_front", -0.14, against="answers to foreign SNI")
     if nosni_open:
-        _add(scores, "ordinary_web_front", -0.05, against="answers without SNI")
+        _add(scores, "ordinary_web_front", -0.10, against="answers without SNI")
+    if foreign_open and nosni_open:
+        _add(scores, "ordinary_web_front", -0.12, against="combined broad-SNI behavior increases scan surface")
     if ws_exposed:
         _add(scores, "ordinary_web_front", -0.18, against="WS transport appears exposed")
     if grpc_exposed:
         _add(scores, "ordinary_web_front", -0.22, against="gRPC transport appears exposed")
     if connect_accepted:
         _add(scores, "ordinary_web_front", -0.22, against="CONNECT accepted like a proxy")
+    if random_path_risk:
+        _add(scores, "ordinary_web_front", -0.10, against="random-path behavior looks selective/unusual")
 
     # Broad TLS front
     if mode == "tcp" and web_ok and public_cert:
@@ -174,6 +182,10 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
             _add(scores, "broad_tls_front", 0.10, "accepts foreign SNI")
         if nosni_open:
             _add(scores, "broad_tls_front", 0.08, "accepts no-SNI clients")
+        if foreign_open and nosni_open:
+            _add(scores, "broad_tls_front", 0.08, "combined foreign-SNI + no-SNI acceptance")
+        if cert_non_public:
+            _add(scores, "broad_tls_front", 0.04, "certificate profile is less typical for mainstream web")
         if connect_rejected:
             _add(scores, "broad_tls_front", 0.03, "still behaves like a normal web server on CONNECT")
         if not ws_exposed and not grpc_exposed:
@@ -195,6 +207,10 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
             _add(scores, "tls_camouflage_relay", 0.09, "accepts foreign SNI")
         if nosni_open:
             _add(scores, "tls_camouflage_relay", 0.07, "accepts no-SNI clients")
+        if foreign_open and nosni_open:
+            _add(scores, "tls_camouflage_relay", 0.10, "combined broad-SNI behavior")
+        if cert_non_public:
+            _add(scores, "tls_camouflage_relay", 0.08, "non-public or unusual certificate profile")
         if not ws_exposed and not grpc_exposed:
             _add(scores, "tls_camouflage_relay", 0.05, "no exposed WS/gRPC transport paths")
         if strong_web:
@@ -302,11 +318,22 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
         })
 
     hypotheses.sort(key=lambda x: x["score"], reverse=True)
+
+    if foreign_open and nosni_open:
+        for h in hypotheses:
+            if h["family"] == "ordinary_web_front":
+                h["score"] = round(max(0.0, h["score"] * 0.82), 3)
+                if h["confidence"] == "high":
+                    h["confidence"] = "medium"
+                h["against"] = (h.get("against", []) + ["broad SNI acceptance weakens 'ordinary front' confidence"])[:5]
+                break
+        hypotheses.sort(key=lambda x: x["score"], reverse=True)
+
     top = hypotheses[0] if hypotheses else None
 
     overall = None
     if top:
-        if top["family"] in {"ordinary_web_front", "no_clear_tunnel_evidence"} and top["score"] >= 0.60 and not ws_exposed and not grpc_exposed and not connect_accepted:
+        if top["family"] in {"ordinary_web_front", "no_clear_tunnel_evidence"} and top["score"] >= 0.60 and not ws_exposed and not grpc_exposed and not connect_accepted and not (foreign_open and nosni_open):
             conf_label = top["confidence"]
             if foreign_open and nosni_open and conf_label == "high":
                 conf_label = "medium"
