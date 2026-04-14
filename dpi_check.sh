@@ -1,515 +1,480 @@
 #!/usr/bin/env bash
-# ┌─────────────────────────────────────────────────────────────┐
-# │  dpi_check.sh — DPI Masquerade Inspector                    │
-# │  Checks TCP/TLS (Reality/VLESS) and UDP/QUIC (Hysteria2)    │
-# │  https://github.com/...                                     │
-# └─────────────────────────────────────────────────────────────┘
-#
-# Usage:
-#   ./dpi_check.sh <host|vless://...|hysteria2://...> [port] [options]
-#
-# Options:
-#   -m, --mode  tcp|udp|auto    Protocol mode (default: auto)
-#   -s, --sni   DOMAIN          Override SNI for TLS probes
-#   -t, --timeout N             Seconds per probe (default: 5)
-#       --no-color              Disable colored output
-#   -h, --help                  Show this help
-#
-# Dependencies:
-#   TCP mode : nmap, openssl, curl, nc
-#   UDP mode : python3 + pip install aioquic
+# DPI Masquerade Inspector v2.2.6
+# TCP/TLS and UDP/QUIC active probing with family inference and hardening hints.
 
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="2.0.0"
+VERSION="2.2.6"
 TIMEOUT=5
+OUTPUT_MODE="text"
+SNI_EXPLICIT=0
+DEBUG_INFER=0
+SHOW_HINTS=1
 
-# ── Colors ────────────────────────────────────────────────────
 setup_colors() {
   if [[ -t 1 ]]; then
-    R='\033[0;31m' G='\033[0;32m' Y='\033[1;33m'
-    C='\033[0;36m' W='\033[1;37m' DIM='\033[2m' BOLD='\033[1m' NC='\033[0m'
+    R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'
+    C='\033[0;36m'; W='\033[1;37m'; DIM='\033[2m'; BOLD='\033[1m'; NC='\033[0m'
   else
-    R='' G='' Y='' C='' W='' DIM='' BOLD='' NC=''
+    R=''; G=''; Y=''; C=''; W=''; DIM=''; BOLD=''; NC=''
   fi
 }
 setup_colors
 no_color() { R=''; G=''; Y=''; C=''; W=''; DIM=''; BOLD=''; NC=''; }
 
-# ── Scoring ───────────────────────────────────────────────────
-SCORE=0; MAX_SCORE=0
-verdict_pass() { SCORE=$((SCORE+2)); MAX_SCORE=$((MAX_SCORE+2)); printf "%b" "${G}✓${NC}"; }
-verdict_warn() { SCORE=$((SCORE+1)); MAX_SCORE=$((MAX_SCORE+2)); printf "%b" "${Y}~${NC}"; }
-verdict_fail() {                     MAX_SCORE=$((MAX_SCORE+2)); printf "%b" "${R}✗${NC}"; }
-verdict_info() {                                                  printf "%b" "${C}•${NC}"; }
-
-# ── Row printer ───────────────────────────────────────────────
-# print_row <num> <label> <detail> <verdict: pass|warn|fail|info>
-print_row() {
-  local num="$1" label="$2" detail="$3" verdict="$4"
-  printf "  ${DIM}[%2s]${NC}  ${W}%-22s${NC}  ${DIM}→${NC}  %-36s  " \
-    "$num" "$label" "${detail:0:36}"
-  case "$verdict" in
-    pass) verdict_pass ;;
-    warn) verdict_warn ;;
-    fail) verdict_fail ;;
-    info) verdict_info ;;
-  esac
-  echo
+json_escape() {
+  python3 - <<'PY' "$1"
+import json,sys
+print(json.dumps(sys.argv[1], ensure_ascii=False))
+PY
 }
 
-div()    { printf "  ${DIM}%s${NC}\n" "$(printf '─%.0s' {1..63})"; }
-header() { printf "\n${C}  ══ %s ${DIM}%s${NC}\n" "$1" "$(printf '═%.0s' $(seq 1 $((55 - ${#1}))))"; }
+findings_json=()
+REACH_PTS=0; REACH_MAX=0
+CAMO_PTS=0; CAMO_MAX=0
+EXPO_PTS=0; EXPO_MAX=0
 
-# ── Banner ────────────────────────────────────────────────────
+score_add() {
+  local axis="$1" value="$2"
+  case "$axis" in
+    reachability) REACH_MAX=$((REACH_MAX+2)); REACH_PTS=$((REACH_PTS+value)) ;;
+    camouflage)   CAMO_MAX=$((CAMO_MAX+2)); CAMO_PTS=$((CAMO_PTS+value)) ;;
+    exposure)     EXPO_MAX=$((EXPO_MAX+2)); EXPO_PTS=$((EXPO_PTS+value)) ;;
+  esac
+}
+
+add_finding() {
+  local id="$1" category="$2" title="$3" severity="$4" observed="$5" impact="$6" axis="$7" score="$8"
+  [[ -n "$axis" && -n "$score" ]] && score_add "$axis" "$score"
+  local obj
+  obj="{\"id\":$(json_escape "$id"),\"category\":$(json_escape "$category"),\"title\":$(json_escape "$title"),\"severity\":$(json_escape "$severity"),\"observed\":$(json_escape "$observed"),\"impact\":$(json_escape "$impact"),\"score_axis\":$(json_escape "$axis"),\"score_value\":$score}"
+  findings_json+=("$obj")
+  if [[ "$OUTPUT_MODE" == "text" ]]; then
+    local sym
+    case "$severity" in
+      ok) sym="${G}✓${NC}" ;;
+      notice) sym="${Y}~${NC}" ;;
+      risk) sym="${R}!${NC}" ;;
+      *) sym="${C}•${NC}" ;;
+    esac
+    printf "  ${DIM}[%02d]${NC} ${W}%-22s${NC} ${DIM}→${NC} %-42s %b\n" "$(( ${#findings_json[@]} ))" "$title" "${observed:0:42}" "$sym"
+    printf "       ${DIM}%s${NC}\n" "$impact"
+  fi
+}
+
+pct() {
+  local pts="$1" max="$2"
+  if [[ "$max" -eq 0 ]]; then echo 0; else echo $(( pts * 100 / max )); fi
+}
+
+require_cmds() {
+  local missing=()
+  for cmd in "$@"; do command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd"); done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "Missing required commands: ${missing[*]}" >&2
+    exit 1
+  fi
+}
+
+is_ipv4() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+is_ipv6() { [[ "$1" == *:* ]]; }
+is_ip_literal() { is_ipv4 "$1" || is_ipv6 "$1"; }
+
 print_banner() {
-  local host="$1" port="$2" proto="$3" ip="$4" asn="$5" sni="$6"
+  local host="$1" port="$2" mode="$3" ip="$4" asn="$5" sni="$6"
+  [[ "$OUTPUT_MODE" != "text" ]] && return
   echo
-  local title="DPI Masquerade Inspector v${VERSION}"
   printf "${C}  ╔═══════════════════════════════════════════════════════════╗${NC}\n"
-  printf "${C}  ║  ${NC}${BOLD}%-55s${NC}  ${C}║${NC}\n" "$title"
+  printf "${C}  ║  ${NC}${BOLD}%-55s${NC}  ${C}║${NC}\n" "DPI Masquerade Inspector v${VERSION}"
   printf "${C}  ╠═══════════════════════════════════════════════════════════╣${NC}\n"
   printf "${C}  ║  ${NC}${DIM}Target${NC}  ${BOLD}%-22s${NC}  ${DIM}Port${NC}  ${BOLD}%-7s${NC}         ${C}║${NC}\n" "$host" "$port"
-  printf "${C}  ║  ${NC}${DIM}IP${NC}      %-22s  ${DIM}Mode${NC}  ${BOLD}%-13s${NC}  ${C}║${NC}\n" "$ip" "$proto"
+  printf "${C}  ║  ${NC}${DIM}IP${NC}      %-22s  ${DIM}Mode${NC}  ${BOLD}%-13s${NC}  ${C}║${NC}\n" "$ip" "$mode"
   printf "${C}  ║  ${NC}${DIM}ASN${NC}     %-53s${C}║${NC}\n" "${asn:0:52} "
-  [[ -n "$sni" && "$sni" != "$host" ]] && \
-  printf "${C}  ║  ${NC}${DIM}SNI${NC}     %-53s${C}║${NC}\n" "$sni "
-  printf "${C}  ╚═══════════════════════════════════════════════════════════╝${NC}\n"
-  echo
+  [[ -n "$sni" ]] && printf "${C}  ║  ${NC}${DIM}SNI${NC}     %-53s${C}║${NC}\n" "${sni:0:52} "
+  printf "${C}  ╚═══════════════════════════════════════════════════════════╝${NC}\n\n"
 }
 
-# ── Summary ───────────────────────────────────────────────────
-print_summary() {
-  [[ $MAX_SCORE -eq 0 ]] && return
-  local pct=$(( SCORE * 100 / MAX_SCORE ))
-  local bar="" filled=$(( pct * 24 / 100 )) empty=$(( 24 - pct * 24 / 100 ))
-  for ((i=0; i<filled; i++)); do bar+="█"; done
-  for ((i=0; i<empty;  i++)); do bar+="░"; done
-
-  local grade label
-  if   [[ $pct -ge 90 ]]; then grade="${G}${BOLD}EXCELLENT${NC}"; label="passes DPI inspection"
-  elif [[ $pct -ge 75 ]]; then grade="${G}GOOD${NC}";             label="minor fingerprint risks"
-  elif [[ $pct -ge 55 ]]; then grade="${Y}AVERAGE${NC}";          label="several issues detected"
-  else                         grade="${R}POOR${NC}";              label="high fingerprint risk"
-  fi
-
-  echo
-  div
-  printf "\n  ${BOLD}Masquerade Score:${NC} ${BOLD}%d%%${NC}  ${DIM}%s${NC}  %b\n" \
-    "$pct" "$bar" "$grade"
-  printf "  ${DIM}%d/%d pts — %s${NC}\n\n" "$SCORE" "$MAX_SCORE" "$label"
-}
-
-# ── URL parser ────────────────────────────────────────────────
-# Sets: URL_SCHEME, URL_HOST, URL_PORT, URL_SNI
 parse_vpn_url() {
   local url="$1"
   URL_SCHEME="${url%%://*}"
   local rest="${url#*://}"
-  rest="${rest%%#*}"                       # strip fragment
+  rest="${rest%%#*}"
   local hostpart="${rest%%\?*}"
   local params="${rest#*\?}"; [[ "$params" == "$rest" ]] && params=""
-  local hostport="${hostpart##*@}"         # strip auth
-  URL_HOST="${hostport%%:*}"
-  URL_PORT="${hostport##*:}"; [[ "$URL_PORT" == "$URL_HOST" ]] && URL_PORT="443"
+  local hostport="${hostpart##*@}"
+  if [[ "$hostport" =~ ^\[(.*)\]:(.*)$ ]]; then
+    URL_HOST="${BASH_REMATCH[1]}"
+    URL_PORT="${BASH_REMATCH[2]}"
+  else
+    URL_HOST="${hostport%%:*}"
+    URL_PORT="${hostport##*:}"
+    [[ "$URL_PORT" == "$URL_HOST" ]] && URL_PORT="443"
+  fi
   URL_SNI=""
   if [[ -n "$params" ]]; then
-    URL_SNI="$(echo "$params" | tr '&' '\n' | grep '^sni=' | cut -d= -f2 | head -1)"
-    # url-decode basic %2F etc — skip for SNI, it's just a domain
+    URL_SNI="$(echo "$params" | tr '&' '\n' | grep '^sni=' | cut -d= -f2- | head -1)"
   fi
 }
 
-# ── ASN lookup ────────────────────────────────────────────────
 get_asn() {
   local ip="$1"
   local asn=""
   asn=$(curl -s --max-time 3 "https://ipinfo.io/${ip}/org" 2>/dev/null) || true
-  [[ -z "$asn" || "$asn" == *"Whoa"* ]] && \
-    asn=$(whois "$ip" 2>/dev/null | grep -iE "^(OrgName|org-name|netname):" | head -1 | sed 's/.*:\s*//' | xargs 2>/dev/null) || true
+  [[ -z "$asn" || "$asn" == *"Whoa"* ]] && asn=$(whois "$ip" 2>/dev/null | grep -iE "^(OrgName|org-name|netname|origin):" | head -1 | sed 's/.*:\s*//' | xargs 2>/dev/null) || true
   echo "${asn:-unknown}"
 }
 
-# ── TCP/TLS checks ────────────────────────────────────────────
+compute_confidence() {
+  local mode="$1" host="$2" sni="$3" cert_extracted="${4:-0}"
+  local score=100
+  local reasons=()
+  if is_ip_literal "$host" && [[ $SNI_EXPLICIT -eq 0 ]]; then
+    score=$((score-35))
+    reasons+=("IP target without explicit --sni")
+  fi
+  if [[ "$mode" == "udp" ]] && is_ip_literal "$sni"; then
+    score=$((score-15))
+    reasons+=("QUIC tested with IP-like SNI")
+  fi
+  if [[ "$mode" == "udp" && "$cert_extracted" -eq 0 ]]; then
+    score=$((score-15))
+    reasons+=("certificate not extracted")
+  fi
+  (( score < 0 )) && score=0
+  local label="high"
+  if (( score < 85 )); then label="medium"; fi
+  if (( score < 60 )); then label="low"; fi
+  CONFIDENCE_SCORE="$score"
+  CONFIDENCE_LABEL="$label"
+  CONFIDENCE_REASONS="${reasons[*]}"
+}
+
+print_notes_and_confidence() {
+  [[ "$OUTPUT_MODE" != "text" ]] && return
+  if is_ip_literal "$host" && [[ $SNI_EXPLICIT -eq 0 ]]; then
+    printf "  %b\n" "${Y}Note:${NC} target is an IP address and no explicit --sni was provided. SNI-sensitive findings may be less reliable."
+  fi
+  printf "  ${BOLD}Confidence${NC}    %3s%%  ${DIM}%s${NC}" "$CONFIDENCE_SCORE" "$CONFIDENCE_LABEL"
+  if [[ -n "${CONFIDENCE_REASONS:-}" ]]; then
+    printf " ${DIM}(reasons: %s)${NC}" "$CONFIDENCE_REASONS"
+  fi
+  printf "\n\n"
+}
+
 run_tcp() {
   local host="$1" port="$2" sni="$3"
+  [[ "$OUTPUT_MODE" == "text" ]] && printf "%b\n\n" "${C}  ══ TCP / TLS INSPECTION ${DIM}══════════════════════════════════${NC}"
 
-  header "TCP / TLS CHECKS"
-  echo
-
-  # [1] Port scan
-  local nmap_out nmap_line
+  local nmap_line
   nmap_line=$(nmap -sV -p "$port" --open "$host" 2>/dev/null | grep "${port}/tcp") || nmap_line=""
   if [[ -n "$nmap_line" ]]; then
-    nmap_out=$(echo "$nmap_line" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/[[:space:]]*$//')
-    print_row 1 "Port scan" "${nmap_out:-open}" pass
+    add_finding "port_scan" "reachability" "Port scan" "ok" "${nmap_line:0:42}" "TCP service is reachable on the target port." "reachability" 2
   elif timeout 2 bash -c "echo >/dev/tcp/${host}/${port}" 2>/dev/null; then
-    print_row 1 "Port scan" "open (nmap inconclusive, TCP verified)" warn
+    add_finding "port_scan" "reachability" "Port scan" "notice" "open via TCP fallback" "Port is reachable, but nmap fingerprint was inconclusive." "reachability" 1
   else
-    print_row 1 "Port scan" "port closed / filtered" fail
+    add_finding "port_scan" "reachability" "Port scan" "risk" "port closed or filtered" "Target is not reachable over TCP on this port." "reachability" 0
   fi
 
-  # [2] TLS certificate
-  local cert_raw cn issuer_o not_after days_left=""
-  cert_raw=$(echo | timeout "$TIMEOUT" openssl s_client \
-    -connect "${host}:${port}" -servername "$sni" 2>/dev/null \
-    | openssl x509 -noout -subject -issuer -dates 2>/dev/null) || cert_raw=""
+  local tls_raw cert_raw cn issuer_o not_after days_left=0 tls_ver cipher alpn
+  tls_raw=$(echo | timeout "$TIMEOUT" openssl s_client -connect "${host}:${port}" -servername "$sni" -alpn "h2,http/1.1" 2>&1 | tr -d '\000') || tls_raw=""
+  cert_raw=$(echo "$tls_raw" | openssl x509 -noout -subject -issuer -dates 2>/dev/null) || cert_raw=""
   cn=$(echo "$cert_raw" | grep subject | sed 's/.*CN *= *//' | sed 's/[,\/].*//')
   issuer_o=$(echo "$cert_raw" | grep issuer | sed 's/.*O *= *//' | sed 's/[,\/].*//')
   not_after=$(echo "$cert_raw" | grep notAfter | cut -d= -f2-)
-  if [[ -n "$not_after" ]]; then
-    days_left=$(( ( $(date -d "$not_after" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 )) || days_left=0
-  fi
+  [[ -n "$not_after" ]] && days_left=$(( ( $(date -d "$not_after" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 )) || true
+  tls_ver=$(echo "$tls_raw" | grep "New," | sed 's/.*New, //;s/,.*//')
+  cipher=$(echo "$tls_raw" | grep "Cipher is" | sed 's/.*Cipher is //' | tr -d ' \r')
+  alpn=$(echo "$tls_raw" | grep "ALPN protocol" | sed 's/.*ALPN protocol: //' | tr -d ' \r')
 
   if [[ -n "$cn" ]]; then
-    local cert_detail="CN=${cn}, ${days_left}d left"
-    local cert_verdict="warn"
+    local cert_detail="CN=${cn}, issuer=${issuer_o:-?}, ${days_left}d left"
     if echo "$issuer_o" | grep -qiE "let.s encrypt|digicert|sectigo|globalsign|comodo|zerossl|google"; then
-      cert_verdict="pass"
-      cert_detail="CN=${cn} (${issuer_o:0:14}), ${days_left}d"
-    elif echo "$cn" | grep -qiE "localhost|self|example"; then
-      cert_verdict="fail"
+      add_finding "tls_cert" "camouflage" "TLS certificate" "ok" "$cert_detail" "Public CA certificate usually blends better with ordinary HTTPS services." "camouflage" 2
+    else
+      add_finding "tls_cert" "camouflage" "TLS certificate" "notice" "$cert_detail" "Certificate works, but trust/profile may look less typical." "camouflage" 1
     fi
-    print_row 2 "TLS certificate" "$cert_detail" "$cert_verdict"
   else
-    print_row 2 "TLS certificate" "no cert returned" fail
+    add_finding "tls_cert" "camouflage" "TLS certificate" "risk" "no certificate returned" "Could not validate the TLS presentation." "camouflage" 0
   fi
 
-  # [3] TLS version & cipher
-  local tls_raw tls_ver cipher alpn
-  tls_raw=$(echo | timeout "$TIMEOUT" openssl s_client \
-    -connect "${host}:${port}" -servername "$sni" -alpn "h2,http/1.1" 2>&1 \
-    | tr -d '\000') || tls_raw=""
-  tls_ver=$(echo "$tls_raw" | grep "New," | sed 's/.*New, //;s/,.*//')
-  cipher=$(echo  "$tls_raw" | grep "Cipher is"   | sed 's/.*Cipher is //' | tr -d ' \r')
-  alpn=$(echo    "$tls_raw" | grep "ALPN protocol" | sed 's/.*ALPN protocol: //' | tr -d ' \r')
-  local tls_detail="${tls_ver:-?} / ${cipher:0:20}${alpn:+ / $alpn}"
-  if   [[ "$tls_ver" == "TLSv1.3" ]]; then print_row 3 "TLS handshake" "$tls_detail" pass
-  elif [[ "$tls_ver" == "TLSv1.2" ]]; then print_row 3 "TLS handshake" "$tls_detail" warn
-  else                                      print_row 3 "TLS handshake" "${tls_detail:-failed}" fail
+  local hs_detail="${tls_ver:-?} / ${cipher:0:20}${alpn:+ / $alpn}"
+  if [[ "$tls_ver" == "TLSv1.3" ]]; then
+    add_finding "tls_handshake" "reachability" "TLS handshake" "ok" "$hs_detail" "TLS endpoint completed a modern handshake successfully." "reachability" 2
+    add_finding "tls_profile" "camouflage" "TLS profile" "ok" "TLSv1.3 / ${cipher:0:20}${alpn:+ / $alpn}" "Modern TLS profile blends better with current HTTPS services." "camouflage" 2
+  elif [[ "$tls_ver" == "TLSv1.2" ]]; then
+    add_finding "tls_handshake" "reachability" "TLS handshake" "ok" "$hs_detail" "TLS endpoint completed a usable handshake successfully." "reachability" 2
+    add_finding "tls_profile" "camouflage" "TLS profile" "notice" "TLSv1.2 / ${cipher:0:20}${alpn:+ / $alpn}" "Service is reachable, but TLS profile is older than many current HTTPS deployments." "camouflage" 1
+  else
+    add_finding "tls_handshake" "reachability" "TLS handshake" "risk" "failed or unknown TLS version" "TLS endpoint did not complete a usable handshake." "reachability" 0
   fi
 
-  # [4] HTTP fallback
-  local http_status ct elapsed
-  http_status=$(curl -sk -o /dev/null -w "%{http_code}" --max-time "$TIMEOUT" \
-    "https://${host}:${port}/") || http_status="000"
-  ct=$(curl -sk -o /dev/null -w "%{content_type}" --max-time "$TIMEOUT" \
-    "https://${host}:${port}/" 2>/dev/null | cut -d';' -f1) || ct=""
-  elapsed=$(curl -sk -o /dev/null -w "%{time_total}" --max-time "$TIMEOUT" \
-    "https://${host}:${port}/" 2>/dev/null) || elapsed=""
-  local fb_detail="HTTP ${http_status} ${ct} (${elapsed}s)"
-  case "$http_status" in
-    200)         print_row 4 "HTTP fallback" "$fb_detail" pass ;;
-    301|302|307) print_row 4 "HTTP fallback" "$fb_detail" warn ;;
-    404|403)     print_row 4 "HTTP fallback" "$fb_detail" warn ;;
-    *)           print_row 4 "HTTP fallback" "no response (HTTP ${http_status})" fail ;;
+  local root_meta root_status root_ct root_elapsed root_headers
+  root_meta=$(curl -sk -D - -o /dev/null -w '\n__TIME__:%{time_total}\n__CTYPE__:%{content_type}\n' --max-time "$TIMEOUT" "https://${host}:${port}/" 2>/dev/null) || root_meta=""
+  root_headers=$(printf "%s" "$root_meta" | sed '/^__TIME__:/,$d')
+  root_status=$(printf "%s" "$root_headers" | head -1 | awk '{print $2}')
+  root_elapsed=$(printf "%s" "$root_meta" | sed -n 's/^__TIME__://p' | head -1)
+  root_ct=$(printf "%s" "$root_meta" | sed -n 's/^__CTYPE__://p' | head -1 | cut -d';' -f1)
+
+  case "$root_status" in
+    200) add_finding "http_fallback" "camouflage" "HTTP fallback" "ok" "HTTP ${root_status} ${root_ct} (${root_elapsed}s)" "Looks like an ordinary HTTPS front page." "camouflage" 2 ;;
+    301|302|307|403|404) add_finding "http_fallback" "camouflage" "HTTP fallback" "notice" "HTTP ${root_status} ${root_ct} (${root_elapsed}s)" "Usable web behavior, though less convincing than a normal 200 page." "camouflage" 1 ;;
+    *) add_finding "http_fallback" "camouflage" "HTTP fallback" "risk" "HTTP ${root_status:-000}" "No credible HTTPS fallback page detected." "camouflage" 0 ;;
   esac
 
-  # [5] HTTP → HTTPS redirect
-  local redir_code redir_url
-  redir_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time "$TIMEOUT" \
-    "http://${host}/" 2>/dev/null) || redir_code="000"
-  redir_url=$(curl -s -o /dev/null -w "%{redirect_url}" --max-time "$TIMEOUT" \
-    "http://${host}/" 2>/dev/null) || redir_url=""
-  local redir_short="${redir_url:0:30}"; [[ -n "$redir_short" ]] && redir_short=" → ${redir_short}"
+  local redirect_meta redir_code redir_url
+  redirect_meta=$(curl -s -o /dev/null -w '%{http_code}\n%{redirect_url}' --max-time "$TIMEOUT" "http://${host}/" 2>/dev/null) || redirect_meta=$'000\n'
+  redir_code=$(printf "%s" "$redirect_meta" | sed -n '1p')
+  redir_url=$(printf "%s" "$redirect_meta" | sed -n '2p')
   case "$redir_code" in
-    301|302) print_row 5 "HTTP→HTTPS redirect" "HTTP ${redir_code}${redir_short}" pass ;;
-    200)     print_row 5 "HTTP→HTTPS redirect" "HTTP 200 (no redirect)" warn ;;
-    *)       print_row 5 "HTTP→HTTPS redirect" "HTTP ${redir_code} (no redirect)" warn ;;
+    301|302) add_finding "http_redirect" "camouflage" "HTTP→HTTPS redirect" "ok" "HTTP ${redir_code} → ${redir_url:0:24}" "Redirect from HTTP to HTTPS matches common site behavior." "camouflage" 2 ;;
+    200|403|404) add_finding "http_redirect" "camouflage" "HTTP→HTTPS redirect" "notice" "HTTP ${redir_code}" "Not ideal, but still plausible web behavior." "camouflage" 1 ;;
+    *) add_finding "http_redirect" "camouflage" "HTTP→HTTPS redirect" "notice" "HTTP ${redir_code}" "Inconclusive camouflage signal." "camouflage" 1 ;;
   esac
 
-  # [6] Mismatched SNI
-  local mis_cn
-  mis_cn=$(echo | timeout "$TIMEOUT" openssl s_client \
-    -connect "${host}:${port}" -servername "google.com" 2>/dev/null \
-    | openssl x509 -noout -subject 2>/dev/null \
-    | sed 's/.*CN *= *//' | sed 's/[,\/].*//') || mis_cn=""
+  local mis_out mis_cn
+  mis_out=$(echo | timeout "$TIMEOUT" openssl s_client -connect "${host}:${port}" -servername "google.com" 2>/dev/null | openssl x509 -noout -subject 2>/dev/null) || mis_out=""
+  mis_cn=$(echo "$mis_out" | sed 's/.*CN *= *//' | sed 's/[,\/].*//')
   if [[ -n "$mis_cn" ]]; then
-    local mis_detail="cert: CN=${mis_cn:0:28}"
-    # Good if server returns its own cert consistently (not a foreign domain's cert)
-    if echo "$mis_cn" | grep -qi "localhost\|self-signed\|example"; then
-      print_row 6 "Mismatched SNI" "$mis_detail (self-signed!)" fail
-    else
-      print_row 6 "Mismatched SNI" "$mis_detail" pass
-    fi
+    add_finding "mismatched_sni" "exposure" "Foreign SNI behavior" "risk" "server returns cert for foreign SNI" "Responding cleanly to arbitrary SNI increases scan surface." "exposure" 0
   else
-    local mis_err
-    mis_err=$(echo | timeout "$TIMEOUT" openssl s_client \
-      -connect "${host}:${port}" -servername "google.com" 2>&1 \
-      | grep -iE "refused|reset|handshake" | head -1) || mis_err="no response"
-    print_row 6 "Mismatched SNI" "${mis_err:-connection closed}" warn
+    add_finding "mismatched_sni" "exposure" "Foreign SNI behavior" "ok" "connection closed or no cert" "Ignoring foreign SNI reduces generic probing surface." "exposure" 2
   fi
 
-  # [7] No SNI
-  local nosni_cn
-  nosni_cn=$(echo | timeout "$TIMEOUT" openssl s_client \
-    -connect "${host}:${port}" -noservername 2>/dev/null \
-    | openssl x509 -noout -subject 2>/dev/null \
-    | sed 's/.*CN *= *//' | sed 's/[,\/].*//') || nosni_cn=""
+  local nosni_out nosni_cn
+  nosni_out=$(echo | timeout "$TIMEOUT" openssl s_client -connect "${host}:${port}" -noservername 2>/dev/null | openssl x509 -noout -subject 2>/dev/null) || nosni_out=""
+  nosni_cn=$(echo "$nosni_out" | sed 's/.*CN *= *//' | sed 's/[,\/].*//')
   if [[ -n "$nosni_cn" ]]; then
-    if echo "$nosni_cn" | grep -qi "localhost\|self-signed"; then
-      print_row 7 "No SNI probe" "cert: CN=${nosni_cn} (self-signed!)" fail
-    else
-      print_row 7 "No SNI probe" "cert: CN=${nosni_cn:0:30}" pass
-    fi
+    add_finding "no_sni" "exposure" "No-SNI behavior" "risk" "certificate returned without SNI" "Serving no-SNI clients makes the endpoint easier to classify." "exposure" 0
   else
-    print_row 7 "No SNI probe" "connection closed / no cert" warn
+    add_finding "no_sni" "exposure" "No-SNI behavior" "ok" "connection closed or no cert" "Requiring SNI reduces generic scan surface." "exposure" 2
   fi
 
-  # [8] Random path
   local rand_path rand_status
-  rand_path="/$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' | head -c 16 || echo "test404path99")"
-  rand_status=$(curl -sk -o /dev/null -w "%{http_code}" --max-time "$TIMEOUT" \
-    "https://${host}:${port}${rand_path}") || rand_status="000"
+  rand_path="/$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' | head -c 16 || echo test404path99)"
+  rand_status=$(curl -sk -o /dev/null -w "%{http_code}" --max-time "$TIMEOUT" "https://${host}:${port}${rand_path}" 2>/dev/null) || rand_status="000"
   case "$rand_status" in
-    200|404|403) print_row 8 "Random path probe" "GET ${rand_path} → HTTP ${rand_status}" pass ;;
-    000)         print_row 8 "Random path probe" "GET ${rand_path} → no response" fail ;;
-    *)           print_row 8 "Random path probe" "GET ${rand_path} → HTTP ${rand_status}" warn ;;
+    404|403|200) add_finding "random_path" "camouflage" "Random path probe" "ok" "GET ${rand_path} → HTTP ${rand_status}" "Unknown paths behave like a normal web app/site." "camouflage" 2 ;;
+    000) add_finding "random_path" "camouflage" "Random path probe" "risk" "GET ${rand_path} → no response" "Selective handling of unknown paths may look unusual." "camouflage" 0 ;;
+    *) add_finding "random_path" "camouflage" "Random path probe" "notice" "GET ${rand_path} → HTTP ${rand_status}" "Behavior is plausible but less typical." "camouflage" 1 ;;
   esac
 
-  # [9] Raw TCP (non-TLS) probe
-  local raw_resp
-  raw_resp=$(printf "GET / HTTP/1.0\r\nHost: %s\r\n\r\n" "$host" \
-    | timeout 3 nc "$host" "$port" 2>/dev/null | head -1 | tr -d '\r') || raw_resp=""
-  if [[ -n "$raw_resp" ]]; then
-    if echo "$raw_resp" | grep -q "400 Bad Request"; then
-      print_row 9 "Raw TCP (non-TLS)" "${raw_resp:0:36}" pass
-    elif echo "$raw_resp" | grep -qi "^HTTP"; then
-      print_row 9 "Raw TCP (non-TLS)" "${raw_resp:0:36}" warn
-    else
-      print_row 9 "Raw TCP (non-TLS)" "${raw_resp:0:36}" fail
-    fi
-  else
-    print_row 9 "Raw TCP (non-TLS)" "no response (connection reset)" warn
-  fi
-
-  # [10] Response headers
-  local resp_headers srv_hdr hsts xframe
+  local resp_headers srv_hdr hsts
   resp_headers=$(curl -sk -I --max-time "$TIMEOUT" "https://${host}:${port}/" 2>/dev/null) || resp_headers=""
-  srv_hdr=$(echo "$resp_headers" | grep -i "^Server:"       | awk '{print $2}' | tr -d '\r')
-  hsts=$(echo    "$resp_headers" | grep -i "^Strict-Trans"  | grep -c "max-age" || true)
-  xframe=$(echo  "$resp_headers" | grep -i "^X-Frame"       | awk '{print $2}' | tr -d '\r')
-  local hdr_detail="Server: ${srv_hdr:-?}"
-  [[ "$hsts" -gt 0 ]]   && hdr_detail+=", HSTS"
-  [[ -n "$xframe" ]] && hdr_detail+=", X-Frame: ${xframe}"
+  srv_hdr=$(echo "$resp_headers" | grep -i '^Server:' | head -1 | awk '{print $2}' | tr -d '\r')
+  hsts=$(echo "$resp_headers" | grep -ic '^Strict-Transport-Security:' || true)
   if [[ -n "$srv_hdr" && "$hsts" -gt 0 ]]; then
-    print_row 10 "Response headers" "$hdr_detail" pass
+    add_finding "headers" "camouflage" "Response headers" "ok" "Server=${srv_hdr}, HSTS=yes" "Header profile looks more like an ordinary HTTPS deployment." "camouflage" 2
   elif [[ -n "$srv_hdr" ]]; then
-    print_row 10 "Response headers" "$hdr_detail" warn
+    add_finding "headers" "camouflage" "Response headers" "notice" "Server=${srv_hdr}, HSTS=no" "Service exposes normal headers, but with a weaker web profile." "camouflage" 1
   else
-    print_row 10 "Response headers" "no Server header" fail
+    add_finding "headers" "camouflage" "Response headers" "notice" "no useful Server header" "Header profile is sparse; camouflage signal is limited." "camouflage" 1
   fi
 
-  # [11] WebSocket endpoint leak
-  # A normal website never returns 101 Switching Protocols to a WS upgrade.
-  # If any path does — the WS transport endpoint is exposed to DPI.
   local ws_paths=("/" "/ws" "/websocket" "/ray" "/v2ray" "/vless" "/vmess" "/api" "/grpc" "/stream")
-  local ws_leaked="" ws_clean=0 ws_checked=0
-  local ws_key="dGhlIHNhbXBsZSBub25jZQ=="  # base64("the sample nonce")
+  local ws_leaked="" ws_key="dGhlIHNhbXBsZSBub25jZQ=="
   for ws_path in "${ws_paths[@]}"; do
     local ws_code
-    ws_code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 3 \
-      -H "Connection: Upgrade" \
-      -H "Upgrade: websocket" \
-      -H "Sec-WebSocket-Key: ${ws_key}" \
-      -H "Sec-WebSocket-Version: 13" \
-      "https://${host}:${port}${ws_path}") || ws_code="000"
-    ws_checked=$((ws_checked + 1))
-    if [[ "$ws_code" == "101" ]]; then
-      ws_leaked+="${ws_path}(101) "
-    else
-      ws_clean=$((ws_clean + 1))
-    fi
+    ws_code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 3 -H "Connection: Upgrade" -H "Upgrade: websocket" -H "Sec-WebSocket-Key: ${ws_key}" -H "Sec-WebSocket-Version: 13" "https://${host}:${port}${ws_path}" 2>/dev/null) || ws_code="000"
+    [[ "$ws_code" == "101" ]] && ws_leaked+="${ws_path}(101) "
   done
   if [[ -n "$ws_leaked" ]]; then
-    print_row 11 "WebSocket leak" "WS endpoint exposed: ${ws_leaked:0:30}" fail
+    add_finding "ws_leak" "exposure" "WebSocket leak" "risk" "upgrade accepted on ${ws_leaked:0:26}" "Exposed WS transport paths are easy to fingerprint." "exposure" 0
   else
-    print_row 11 "WebSocket leak" "no WS upgrade on ${ws_checked} paths" pass
+    add_finding "ws_leak" "exposure" "WebSocket leak" "ok" "no WS upgrade on common paths" "No obvious WS transport endpoint exposure found." "exposure" 2
   fi
 
-  # [12] gRPC endpoint leak
-  # Normal servers return 415/404/400 to gRPC content-type.
-  # An exposed gRPC transport returns 200 with grpc-status or trailers.
   local grpc_paths=("/" "/grpc" "/ray" "/vless" "/vmess" "/tun" "/api")
-  local grpc_leaked="" grpc_clean=0
+  local grpc_strong="" grpc_hint=""
   for grpc_path in "${grpc_paths[@]}"; do
-    local grpc_code grpc_ct
-    grpc_code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 3 \
-      -X POST \
-      -H "Content-Type: application/grpc" \
-      -H "TE: trailers" \
-      "https://${host}:${port}${grpc_path}") || grpc_code="000"
-    grpc_ct=$(curl -sk -D - -o /dev/null --max-time 3 \
-      -X POST \
-      -H "Content-Type: application/grpc" \
-      -H "TE: trailers" \
-      "https://${host}:${port}${grpc_path}" 2>/dev/null \
-      | grep -i "content-type:" | grep -i "grpc" | head -1) || grpc_ct=""
-    if [[ -n "$grpc_ct" || "$grpc_code" == "200" ]]; then
-      grpc_leaked+="${grpc_path}(${grpc_code}) "
-    else
-      grpc_clean=$((grpc_clean + 1))
+    local grpc_dump grpc_code grpc_ct grpc_status grpc_msg
+    grpc_dump=$(curl -sk -D - -o /dev/null --max-time 3 -X POST -H "Content-Type: application/grpc" -H "TE: trailers" "https://${host}:${port}${grpc_path}" 2>/dev/null) || grpc_dump=""
+    grpc_code=$(printf "%s" "$grpc_dump" | head -1 | awk '{print $2}')
+    grpc_ct=$(printf "%s" "$grpc_dump" | grep -i '^content-type:' | grep -i 'grpc' | head -1) || grpc_ct=""
+    grpc_status=$(printf "%s" "$grpc_dump" | grep -i '^grpc-status:' | head -1) || grpc_status=""
+    grpc_msg=$(printf "%s" "$grpc_dump" | grep -i '^grpc-message:' | head -1) || grpc_msg=""
+    if [[ -n "$grpc_ct" || -n "$grpc_status" || -n "$grpc_msg" ]]; then
+      grpc_strong+="${grpc_path}(${grpc_code:-000}) "
+    elif [[ "$grpc_code" == "200" ]]; then
+      grpc_hint+="${grpc_path}(200) "
     fi
   done
-  if [[ -n "$grpc_leaked" ]]; then
-    print_row 12 "gRPC leak" "gRPC endpoint exposed: ${grpc_leaked:0:28}" fail
+  if [[ -n "$grpc_strong" ]]; then
+    add_finding "grpc_leak" "exposure" "gRPC leak" "risk" "strong gRPC semantics on ${grpc_strong:0:24}" "Exposed gRPC transport paths increase fingerprintability." "exposure" 0
+  elif [[ -n "$grpc_hint" ]]; then
+    add_finding "grpc_leak" "exposure" "gRPC leak" "notice" "weak gRPC hint on ${grpc_hint:0:26}" "A plain HTTP 200 to a gRPC-like POST is weak evidence by itself and may be a normal web app behavior." "exposure" 1
   else
-    print_row 12 "gRPC leak" "no gRPC response on ${#grpc_paths[@]} paths" pass
+    add_finding "grpc_leak" "exposure" "gRPC leak" "ok" "no gRPC response on common paths" "No obvious gRPC transport endpoint exposure found." "exposure" 2
   fi
 
-  # [13] HTTP CONNECT probe
-  # Proxies accept CONNECT method. A real web server rejects it with 405/400.
   local connect_code
-  connect_code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 3 \
-    -X CONNECT "https://${host}:${port}/") || connect_code="000"
+  connect_code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 3 -X CONNECT "https://${host}:${port}/" 2>/dev/null) || connect_code="000"
   case "$connect_code" in
-    200)         print_row 13 "HTTP CONNECT" "accepted (200) — proxy behavior!" fail ;;
-    000)         print_row 13 "HTTP CONNECT" "connection reset / no response" warn ;;
-    400|405|501) print_row 13 "HTTP CONNECT" "rejected (${connect_code}) — normal" pass ;;
-    *)           print_row 13 "HTTP CONNECT" "HTTP ${connect_code}" warn ;;
+    200) add_finding "http_connect" "exposure" "HTTP CONNECT" "risk" "CONNECT accepted (200)" "Accepting CONNECT resembles proxy behavior." "exposure" 0 ;;
+    400|405|501) add_finding "http_connect" "exposure" "HTTP CONNECT" "ok" "CONNECT rejected (${connect_code})" "Rejecting CONNECT matches ordinary web server behavior." "exposure" 2 ;;
+    *) add_finding "http_connect" "exposure" "HTTP CONNECT" "notice" "CONNECT returned ${connect_code}" "Behavior is not clearly proxy-like, but not strongly normal either." "exposure" 1 ;;
   esac
-
-  # [14] Path behavior consistency
-  # A normal server responds identically to any unknown path.
-  # Inconsistency (some paths 000, others 200) suggests selective routing.
-  local paths_to_check=("/aaa111" "/bbb222" "/ccc333" "/ddd444" "/eee555")
-  local codes=() unique_codes
-  for chk_path in "${paths_to_check[@]}"; do
-    local chk_code
-    chk_code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 3 \
-      "https://${host}:${port}${chk_path}") || chk_code="000"
-    codes+=("$chk_code")
-  done
-  unique_codes=$(printf '%s\n' "${codes[@]}" | sort -u | tr '\n' ' ' | sed 's/ $//')
-  local unique_count
-  unique_count=$(printf '%s\n' "${codes[@]}" | sort -u | wc -l)
-  if [[ "$unique_count" -eq 1 ]]; then
-    print_row 14 "Path consistency" "all paths → ${unique_codes} (consistent)" pass
-  elif [[ "$unique_count" -eq 2 ]]; then
-    print_row 14 "Path consistency" "responses: ${unique_codes} (minor variance)" warn
-  else
-    print_row 14 "Path consistency" "inconsistent: ${unique_codes}" fail
-  fi
 }
 
-# ── UDP/QUIC mode ─────────────────────────────────────────────
 run_udp() {
   local host="$1" port="$2" sni="$3"
-  if ! command -v python3 &>/dev/null; then
-    printf "\n  ${R}Error:${NC} python3 required for UDP/QUIC mode\n"
-    printf "  Install: ${DIM}apt install python3 && pip3 install aioquic${NC}\n\n"
-    exit 1
-  fi
-  # Pass color flag to python prober
+  local extra_flags=()
+  is_ip_literal "$host" && extra_flags+=(--host-is-ip)
+  [[ $SNI_EXPLICIT -eq 1 ]] && extra_flags+=(--sni-explicit)
+  [[ $DEBUG_INFER -eq 1 ]] && extra_flags+=(--debug)
+  require_cmds python3
   local color_flag=""
   [[ -z "$NC" ]] && color_flag="--no-color"
-  python3 "${SCRIPT_DIR}/quic_probe.py" "$host" "$port" "$sni" $color_flag
+  if [[ "$OUTPUT_MODE" == "json" ]]; then
+    python3 "${SCRIPT_DIR}/quic_probe.py" "$host" "$port" "$sni" $color_flag --timeout "$TIMEOUT" --json "${extra_flags[@]}"
+  else
+    python3 "${SCRIPT_DIR}/quic_probe.py" "$host" "$port" "$sni" $color_flag --timeout "$TIMEOUT" "${extra_flags[@]}"
+  fi
 }
 
-# ── Help ──────────────────────────────────────────────────────
+build_payload_json() {
+  local host="$1" port="$2" mode="$3" ip="$4" asn="$5" sni="$6" cert_extracted="${7:-0}"
+  compute_confidence "$mode" "$host" "$sni" "$cert_extracted"
+  local findings_joined=""
+  local first=1
+  for item in "${findings_json[@]}"; do
+    if [[ $first -eq 1 ]]; then findings_joined+="$item"; first=0; else findings_joined+=",$item"; fi
+  done
+  cat <<EOF
+{
+  "target": {
+    "host": $(json_escape "$host"),
+    "port": $port,
+    "mode": $(json_escape "$mode"),
+    "ip": $(json_escape "$ip"),
+    "asn": $(json_escape "$asn"),
+    "sni": $(json_escape "$sni")
+  },
+  "confidence": {
+    "score": $CONFIDENCE_SCORE,
+    "label": $(json_escape "$CONFIDENCE_LABEL"),
+    "reasons": $(json_escape "$CONFIDENCE_REASONS")
+  },
+  "scores": {
+    "reachability": {"pts": $REACH_PTS, "max": $REACH_MAX, "pct": $(pct "$REACH_PTS" "$REACH_MAX")},
+    "camouflage": {"pts": $CAMO_PTS, "max": $CAMO_MAX, "pct": $(pct "$CAMO_PTS" "$CAMO_MAX")},
+    "exposure": {"pts": $EXPO_PTS, "max": $EXPO_MAX, "pct": $(pct "$EXPO_PTS" "$EXPO_MAX")}
+  },
+  "findings": [${findings_joined}]
+}
+EOF
+}
+
+emit_json() {
+  local host="$1" port="$2" mode="$3" ip="$4" asn="$5" sni="$6" cert_extracted="${7:-0}"
+  build_payload_json "$host" "$port" "$mode" "$ip" "$asn" "$sni" "$cert_extracted" | python3 "${SCRIPT_DIR}/protocol_infer.py" --enrich
+}
+
+print_inference_text() {
+  [[ "$OUTPUT_MODE" != "text" ]] && return
+  local cert_extracted=0
+  [[ -n "${cn:-}" ]] && cert_extracted=1
+  local args=(--text)
+  [[ $DEBUG_INFER -eq 1 ]] && args+=(--debug)
+  build_payload_json "$host" "$port" "tcp" "$ip" "$asn" "$sni" "$cert_extracted" | python3 "${SCRIPT_DIR}/protocol_infer.py" "${args[@]}"
+}
+
+print_summary() {
+  [[ "$OUTPUT_MODE" != "text" ]] && return
+  local cert_extracted=0
+  [[ -n "${cn:-}" ]] && cert_extracted=1
+  compute_confidence "tcp" "$host" "$sni" "$cert_extracted"
+  echo
+  printf "  ${BOLD}Reachability${NC}  %3s%%  ${DIM}%s/%s pts${NC}\n" "$(pct "$REACH_PTS" "$REACH_MAX")" "$REACH_PTS" "$REACH_MAX"
+  printf "  ${BOLD}Camouflage${NC}    %3s%%  ${DIM}%s/%s pts${NC}\n" "$(pct "$CAMO_PTS" "$CAMO_MAX")" "$CAMO_PTS" "$CAMO_MAX"
+  printf "  ${BOLD}Exposure${NC}      %3s%%  ${DIM}%s/%s pts${NC}\n" "$(pct "$EXPO_PTS" "$EXPO_MAX")" "$EXPO_PTS" "$EXPO_MAX"
+  print_notes_and_confidence
+}
+
 usage() {
   cat <<EOF
 
-${BOLD}dpi_check.sh${NC} v${VERSION} — DPI Masquerade Inspector
+${BOLD}dpi_check.sh${NC} v${VERSION} — DPI Masquerade Inspector + protocol inference
 
 ${BOLD}USAGE${NC}
   $(basename "$0") <target> [port] [options]
 
-${BOLD}TARGET${NC}
-  hostname / IP          example.com
-  vless:// URL           vless://uuid@host:443?sni=github.com&...
-  hysteria2:// URL       hysteria2://pass@host:443?sni=bing.com
-
 ${BOLD}OPTIONS${NC}
   -m, --mode  tcp|udp|auto   Protocol (default: auto-detect)
-  -s, --sni   DOMAIN         Override SNI for TLS probes
+  -s, --sni   DOMAIN         Override SNI for probes
   -t, --timeout N            Probe timeout in seconds (default: 5)
+      --json                 Emit machine-readable JSON
+      --debug-infer          Show inference internals and ranked hypotheses
+      --hardening-hints      Show hardening hints in the text output (default on)
+      --recommend-fixes      Alias for --hardening-hints
       --no-color             Plain output, no ANSI colors
   -h, --help                 Show this help
-
-${BOLD}EXAMPLES${NC}
-  $(basename "$0") example.com
-  $(basename "$0") 1.2.3.4 443 --mode tcp --sni github.com
-  $(basename "$0") vless://uuid@server.com:443?security=reality&sni=apple.com
-  $(basename "$0") hysteria2://auth@server.com:443
-
-${BOLD}SCORE LEGEND${NC}
-  ${G}✓${NC} pass (2pts)   ${Y}~${NC} warn (1pt)   ${R}✗${NC} fail (0pts)   ${C}•${NC} info (no score)
-
-${BOLD}REQUIREMENTS${NC}
-  TCP mode : nmap, openssl, curl, nc
-  UDP mode : python3, pip install aioquic
 
 EOF
 }
 
-# ── Main ──────────────────────────────────────────────────────
 main() {
   [[ $# -eq 0 ]] && { usage; exit 0; }
   [[ "$1" == "-h" || "$1" == "--help" ]] && { usage; exit 0; }
 
   local host="" port="443" mode="auto" sni=""
-
-  # First arg — host or VPN URL
   local first="$1"; shift
-  if echo "$first" | grep -qE "^(vless|hysteria2|trojan|ss)://"; then
+  if echo "$first" | grep -qE '^(vless|hysteria2|trojan|ss)://'; then
     parse_vpn_url "$first"
     host="$URL_HOST"; port="$URL_PORT"; sni="${URL_SNI:-}"
+    [[ -n "$sni" ]] && SNI_EXPLICIT=1
     case "$URL_SCHEME" in
-      hysteria2)     mode="udp" ;;
-      vless|trojan)  mode="tcp" ;;
+      hysteria2) mode="udp" ;;
+      vless|trojan) mode="tcp" ;;
     esac
   else
     host="$first"
     [[ $# -gt 0 && "$1" =~ ^[0-9]+$ ]] && { port="$1"; shift; }
   fi
 
-  # Remaining options
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      -m|--mode)    mode="$2";    shift 2 ;;
-      -s|--sni)     sni="$2";     shift 2 ;;
+      -m|--mode) mode="$2"; shift 2 ;;
+      -s|--sni) sni="$2"; SNI_EXPLICIT=1; shift 2 ;;
       -t|--timeout) TIMEOUT="$2"; shift 2 ;;
-      --no-color)   no_color;     shift   ;;
-      -h|--help)    usage; exit 0 ;;
-      *) printf "Unknown option: %s\n" "$1"; usage; exit 1 ;;
+      --json) OUTPUT_MODE="json"; shift ;;
+      --debug-infer) DEBUG_INFER=1; shift ;;
+      --hardening-hints|--recommend-fixes) SHOW_HINTS=1; shift ;;
+      --no-color) no_color; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
     esac
   done
 
   [[ -z "$sni" ]] && sni="$host"
 
-  # Resolve IP
   local ip=""
   ip=$(dig +short "$host" 2>/dev/null | grep -E '^[0-9]' | head -1) || true
-  [[ -z "$ip" ]] && ip=$(getent hosts "$host" 2>/dev/null | awk '{print $1}') || true
+  [[ -z "$ip" ]] && ip=$(getent hosts "$host" 2>/dev/null | awk '{print $1}' | head -1) || true
   [[ -z "$ip" ]] && ip="$host"
-
-  # ASN (best-effort, non-blocking)
   local asn=""
   asn=$(get_asn "$ip") || asn="unknown"
 
-  # Auto-detect protocol
   if [[ "$mode" == "auto" ]]; then
-    if timeout 2 bash -c "echo >/dev/tcp/${host}/${port}" 2>/dev/null; then
-      mode="tcp"
-    else
-      mode="udp"
-    fi
+    if timeout 2 bash -c "echo >/dev/tcp/${host}/${port}" 2>/dev/null; then mode="tcp"; else mode="udp"; fi
   fi
 
-  local proto_label
-  case "$mode" in
-    tcp) proto_label="TCP / TLS" ;;
-    udp) proto_label="UDP / QUIC" ;;
-    *)   proto_label="$mode" ;;
-  esac
-
-  print_banner "$host" "$port" "$proto_label" "$ip" "$asn" "$sni"
-
-  if [[ "$mode" == "tcp" ]]; then
-    run_tcp "$host" "$port" "$sni"
-    print_summary
-  else
+  if [[ "$mode" == "udp" ]]; then
+    print_banner "$host" "$port" "UDP / QUIC" "$ip" "$asn" "$sni"
     run_udp "$host" "$port" "$sni"
+    exit 0
+  fi
+
+  require_cmds nmap openssl curl nc dig getent python3
+  print_banner "$host" "$port" "TCP / TLS" "$ip" "$asn" "$sni"
+  run_tcp "$host" "$port" "$sni"
+
+  if [[ "$OUTPUT_MODE" == "json" ]]; then
+    local cert_extracted=0
+    [[ -n "${cn:-}" ]] && cert_extracted=1
+    emit_json "$host" "$port" "tcp" "$ip" "$asn" "$sni" "$cert_extracted"
+  else
+    print_summary
+    print_inference_text
   fi
 }
 
