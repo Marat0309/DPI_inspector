@@ -1,173 +1,138 @@
-# dpi-check
+# DPI / TLS masquerade inspector for analyzing web-front behavior and TLS surface
 
-A shell tool that measures **how well a server's masquerade holds up against DPI inspection**.
+Инструмент для практической оценки того, насколько сервер выглядит как «обычный веб‑фронт» с точки зрения активных сетевых проверок.
 
-It does not try to detect which VPN protocol is running. It probes the server the way a DPI system or a censor would — and scores how closely it resembles a normal web server.
+## What the tool does
 
-Supports both **TCP/TLS** servers (VLESS+Reality, Trojan, NaiveProxy, V2Ray WS/gRPC/H2, XTLS Vision) and **UDP/QUIC** servers (Hysteria2, TUIC, V2Ray QUIC).
+`dpi_check.sh` выполняет эвристический анализ сетевой поверхности и помогает понять, насколько конфигурация похожа на нормальный web/TLS сервис:
 
----
+- анализирует TLS, HTTP, ALPN и SNI-поведение;
+- выявляет web-front паттерны и аномалии поверхности;
+- формирует гипотезы по протоколу (а не «точное определение»).
 
-## What it checks
+## What it does NOT do
 
-### TCP / TLS mode — 15 checks
+Важно:
 
-| # | Check | What it catches |
-|---|-------|-----------------|
-| 1 | Port scan | Service fingerprint visible to scanners |
-| 2 | TLS certificate | Self-signed vs trusted CA, expiry |
-| 3 | TLS handshake | Version (1.3/1.2), cipher, ALPN |
-| 4 | HTTP fallback | Does the server serve a real page? |
-| 5 | HTTP→HTTPS redirect | Does port 80 redirect properly? |
-| 6 | Mismatched SNI | Certificate served with foreign SNI |
-| 7 | No SNI | Certificate served without SNI |
-| 8 | Random path | Consistent response to unknown paths |
-| 9 | Response headers | Server header and HSTS profile |
-| 10 | ALPN profile | H2/H1.1 behavior consistency |
-| 11 | **WebSocket leak** | Exposed WS endpoint on common paths |
-| 12 | **gRPC leak** | Weak/strong gRPC hints on common paths |
-| 13 | **gRPC strict probe** | Strict HTTP/2 gRPC semantics exposure |
-| 14 | **HTTP CONNECT** | Server accepts CONNECT (proxy behavior) |
-| 15 | Inference layer | Cross-check of combined findings |
+- не гарантирует обнаружение VPN/proxy;
+- не определяет точный протокол со 100% уверенностью;
+- все выводы являются эвристикой.
 
-### UDP / QUIC mode — 8 checks
-
-| # | Check | What it catches |
-|---|-------|-----------------|
-| 1 | UDP port scan | Port reachability |
-| 2 | Raw UDP junk | Server responds to invalid QUIC packets |
-| 3 | QUIC handshake | TLS handshake success / failure |
-| 4 | TLS certificate | Certificate quality |
-| 5 | Mismatched SNI | Server accepts any SNI |
-| 6 | No SNI | Server behavior without SNI |
-| 7 | HTTP/3 fallback | H3 response to GET / |
-| 8 | Port hopping range | Spot-check of hopping port range |
-
----
-
-## Score
-
-Each check returns **pass** (2 pts), **warn** (1 pt), **fail** (0 pts), or **info** (no score).
-
-```
-96%  ███████████████████████░  EXCELLENT — passes DPI inspection
-75%  ██████████████████░░░░░░  GOOD      — minor fingerprint risks
-55%  █████████████░░░░░░░░░░░  AVERAGE   — several issues detected
- <55%  ████░░░░░░░░░░░░░░░░░░░░  POOR      — high fingerprint risk
-```
-
----
-
-## Install
-
-```bash
-git clone https://github.com/your-username/dpi-check
-cd dpi-check
-chmod +x dpi_check.sh
-
-# UDP/QUIC mode only:
-pip install -r requirements.txt
-```
+## Installation
 
 ### Dependencies
 
-| Tool | Purpose | Install |
-|------|---------|---------|
-| `nmap` | Port scanning | `apt install nmap` |
-| `openssl` | TLS probing | usually pre-installed |
-| `curl` | HTTP probing | usually pre-installed |
-| `nc` | Raw TCP probe | `apt install netcat-openbsd` |
-| `python3` + `aioquic` | UDP/QUIC probing | `pip install aioquic` |
+Требуются:
 
----
+- `bash`
+- `curl`
+- `openssl`
+- `jq`
+- `python3`
 
-## Usage
+(Для некоторых окружений также могут использоваться системные утилиты вроде `nmap`/`nc`, если они доступны.)
 
-```bash
-./dpi_check.sh <target> [port] [options]
-```
-
-**Target** can be a hostname, IP address, or a VPN config URL:
+### Clone and run
 
 ```bash
-# Hostname (auto-detects TCP/UDP)
-./dpi_check.sh example.com
-
-# IP + port + forced TCP mode with custom SNI
-./dpi_check.sh 1.2.3.4 443 --mode tcp --sni github.com
-
-# Parse vless:// URL directly — extracts host, port, SNI automatically
-./dpi_check.sh "vless://uuid@server.com:443?security=reality&sni=apple.com"
-
-# Parse hysteria2:// URL directly
-./dpi_check.sh "hysteria2://password@server.com:443"
+git clone <your-repo-url>
+cd DPI_inspector
+chmod +x dpi_check.sh validate.sh
+bash dpi_check.sh example.com
 ```
 
-### Options
+## Usage examples
 
-```
--m, --mode  tcp|udp|auto    Protocol mode (default: auto-detect)
--s, --sni   DOMAIN          Override SNI for TLS probes
--t, --timeout N             Seconds per probe (default: 5)
-    --no-color              Plain output without ANSI colors
--h, --help                  Show help
+```bash
+bash dpi_check.sh example.com
+bash dpi_check.sh example.com 443 --sni domain.com
+bash dpi_check.sh example.com --lang=ru
 ```
 
----
+## Output explanation
 
-## Example output
+Ключевые поля в итоговом блоке:
 
+- **Reachability** — доступность цели и корректность сетевого отклика.
+- **Camouflage** — насколько поведение похоже на обычный веб-сайт.
+- **Exposure** — насколько заметны нетипичные/служебные признаки.
+- **TLS surface class** — класс TLS-поверхности (обобщенный профиль).
+- **Cert routing profile** — поведение сертификатов при разных SNI.
+- **Surface risk** — интегральная оценка рискованности поверхности.
+- **Protocol hypotheses** — вероятные семейства/режимы протокола.
+- **Overall assessment** — общий практический вывод по маскировке.
+
+## Interpretation guide
+
+Примеры интерпретации:
+
+- **"Ordinary web front"** → поведение близко к нормальному сайту.
+- **"same_cert_broad_front"** → на «чужом» SNI часто отдается тот же сертификат.
+- **"default_cert_broad_front"** → на «чужом» SNI отдается иной/дефолтный сертификат (обычно подозрительнее).
+
+## Hardening hints
+
+`dpi_check.sh` может показывать подсказки по укреплению поверхности:
+
+- это рекомендации, а не гарантированные исправления;
+- в первую очередь полезны для self-hosted конфигураций `nginx`/`caddy`.
+
+См. также вспомогательный скрипт `harden_nginx.sh`.
+
+## Example outputs (short)
+
+### 1) normal site
+
+```text
+[01] Port scan              → 443/tcp open https
+[02] TLS certificate        → CN=example.com, issuer=Let's Encrypt
+[03] Mismatched SNI         → cert: CN=example.com
+TLS surface class: ordinary_web_front
+Surface risk: low
+Overall assessment: Ordinary web front
 ```
-  ╔═══════════════════════════════════════════════════════════╗
-  ║  DPI Masquerade Inspector v2.0.0                          ║
-  ╠═══════════════════════════════════════════════════════════╣
-  ║  Target  example.com             Port  443             ║
-  ║  IP      1.2.3.4                 Mode  TCP / TLS      ║
-  ║  ASN     AS12345 Example Hosting Ltd                        ║
-  ╚═══════════════════════════════════════════════════════════╝
 
-  ══ TCP / TLS CHECKS ═══════════════════════════════════════
+### 2) same_cert_broad_front
 
-  [ 1]  Port scan               →  ssl/http nginx                        ✓
-  [ 2]  TLS certificate         →  CN=example.com (Let's Encrypt), 89d   ✓
-  [ 3]  TLS handshake           →  TLSv1.3 / TLS_AES_256_GCM_SHA384 / h2 ✓
-  [ 4]  HTTP fallback           →  HTTP 200 text/html (0.012s)           ✓
-  [ 5]  HTTP→HTTPS redirect     →  HTTP 301 → https://example.com/       ✓
-  [ 6]  Mismatched SNI          →  cert: CN=example.com                  ✓
-  [ 7]  No SNI probe            →  cert: CN=example.com                  ✓
-  [ 8]  Random path probe       →  GET /a3f9c2d1 → HTTP 200              ✓
-  [ 9]  Raw TCP (non-TLS)       →  HTTP/1.1 400 Bad Request              ✓
-  [10]  Response headers        →  Server: nginx, HSTS, X-Frame: DENY    ✓
-  [11]  WebSocket leak          →  no WS upgrade on 10 paths             ✓
-  [12]  gRPC leak               →  no gRPC response on 7 paths           ✓
-  [13]  HTTP CONNECT            →  rejected (405) — normal               ✓
-  [14]  Path consistency        →  all paths → 200 (consistent)          ✓
-
-  ───────────────────────────────────────────────────────────────
-
-  Masquerade Score: 96%  ███████████████████████░  EXCELLENT
-  27/28 pts — passes DPI inspection
+```text
+[01] Port scan              → 443/tcp open ssl/http
+[02] TLS certificate        → CN=front.example.net, issuer=Public CA
+[06] Mismatched SNI         → cert unchanged on unknown SNI
+TLS surface class: same_cert_broad_front
+Cert routing profile: broad (same cert)
+Surface risk: medium
+Overall assessment: Camouflage is broad but detectable
 ```
 
----
+### 3) default_cert_broad_front
 
-## Protocol support
+```text
+[01] Port scan              → 443/tcp open ssl/http
+[02] TLS certificate        → CN=service.example.org
+[06] Mismatched SNI         → default/other cert on unknown SNI
+TLS surface class: default_cert_broad_front
+Cert routing profile: broad (default cert fallback)
+Surface risk: elevated
+Overall assessment: Front behavior looks less typical
+```
 
-| Protocol | Mode | Coverage |
-|----------|------|----------|
-| VLESS + Reality / XTLS Vision | TCP | Full |
-| Trojan / Trojan-Go | TCP | Full |
-| NaiveProxy | TCP | Full |
-| V2Ray WebSocket + TLS | TCP | Full (incl. WS leak check) |
-| V2Ray gRPC + TLS | TCP | Full (incl. gRPC leak check) |
-| V2Ray HTTP/2 | TCP | Full |
-| Hysteria2 | UDP | Full |
-| TUIC v5 | UDP | Partial |
-| V2Ray QUIC | UDP | Partial |
-| Hysteria v1 | UDP | Partial |
-| mKCP | — | Not supported |
+Больше примеров в каталоге `examples/`.
 
----
+## Related script
+
+- `harden_nginx.sh` — helper для улучшения TLS surface на nginx.
+
+## Release notes
+
+- stable beta;
+- inference is heuristic;
+- improvements expected based on real-world feedback.
+
+## Validation
+
+```bash
+bash validate.sh
+```
 
 ## License
 

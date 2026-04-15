@@ -1,0 +1,9 @@
+# same_cert_broad_front (trimmed)
+[01] Port scan              → 443/tcp open ssl/http
+[02] TLS certificate        → CN=front.example.net, issuer=Public CA
+[06] Mismatched SNI         → cert unchanged on unknown SNI
+[07] No SNI probe           → cert unchanged
+TLS surface class: same_cert_broad_front
+Cert routing profile: broad (same cert)
+Surface risk: medium
+Overall assessment: Camouflage is broad but detectable

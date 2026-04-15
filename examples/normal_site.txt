@@ -1,0 +1,10 @@
+# normal_site (trimmed)
+[01] Port scan              → 443/tcp open https
+[02] TLS certificate        → CN=example.com, issuer=Let's Encrypt
+[03] TLS handshake          → TLSv1.3 / h2
+[06] Mismatched SNI         → cert: CN=example.com
+[07] No SNI probe           → cert: CN=example.com
+TLS surface class: ordinary_web_front
+Cert routing profile: tight
+Surface risk: low
+Overall assessment: Ordinary web front
