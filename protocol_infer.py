@@ -227,7 +227,6 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
             _add(scores, "tls_camouflage_relay", 0.10, "combined broad-SNI behavior")
         if cert_non_public:
             _add(scores, "tls_camouflage_relay", 0.08, "non-public or unusual certificate profile")
-        if not ws_exposed and not grpc_exposed and not grpc_strict_exposed:
         if not ws_exposed and not grpc_exposed:
             _add(scores, "tls_camouflage_relay", 0.05, "no exposed WS/gRPC transport paths")
         if strong_web:
@@ -354,7 +353,6 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     overall = None
     if top:
-        if top["family"] in {"ordinary_web_front", "no_clear_tunnel_evidence"} and top["score"] >= 0.60 and not ws_exposed and not grpc_exposed and not grpc_strict_exposed and not connect_accepted and not (foreign_open and nosni_open):
         if top["family"] in {"ordinary_web_front", "no_clear_tunnel_evidence"} and top["score"] >= 0.60 and not ws_exposed and not grpc_exposed and not grpc_strict_exposed and not connect_accepted and not (foreign_open and nosni_open):
             conf_label = top["confidence"]
             if foreign_open and nosni_open and conf_label == "high":
