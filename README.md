@@ -10,7 +10,7 @@ Supports both **TCP/TLS** servers (VLESS+Reality, Trojan, NaiveProxy, V2Ray WS/g
 
 ## What it checks
 
-### TCP / TLS mode — 14 checks
+### TCP / TLS mode — 15 checks
 
 | # | Check | What it catches |
 |---|-------|-----------------|
@@ -22,12 +22,13 @@ Supports both **TCP/TLS** servers (VLESS+Reality, Trojan, NaiveProxy, V2Ray WS/g
 | 6 | Mismatched SNI | Certificate served with foreign SNI |
 | 7 | No SNI | Certificate served without SNI |
 | 8 | Random path | Consistent response to unknown paths |
-| 9 | Raw TCP (non-TLS) | Proper rejection of plaintext |
-| 10 | Response headers | Server header, HSTS, X-Frame-Options |
+| 9 | Response headers | Server header and HSTS profile |
+| 10 | ALPN profile | H2/H1.1 behavior consistency |
 | 11 | **WebSocket leak** | Exposed WS endpoint on common paths |
-| 12 | **gRPC leak** | Exposed gRPC endpoint on common paths |
-| 13 | **HTTP CONNECT** | Server accepts CONNECT (proxy behavior) |
-| 14 | **Path consistency** | Different paths return inconsistent codes |
+| 12 | **gRPC leak** | Weak/strong gRPC hints on common paths |
+| 13 | **gRPC strict probe** | Strict HTTP/2 gRPC semantics exposure |
+| 14 | **HTTP CONNECT** | Server accepts CONNECT (proxy behavior) |
+| 15 | Inference layer | Cross-check of combined findings |
 
 ### UDP / QUIC mode — 8 checks
 
