@@ -4,9 +4,11 @@
 
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/lang.sh"
 VERSION="2.2.7"
 TIMEOUT=5
 OUTPUT_MODE="text"
+LANG_MODE="en"
 SNI_EXPLICIT=0
 DEBUG_INFER=0
 SHOW_HINTS=1
@@ -173,7 +175,7 @@ print_notes_and_confidence() {
   if is_ip_literal "$host" && [[ $SNI_EXPLICIT -eq 0 ]]; then
     printf "  %b\n" "${Y}Note:${NC} target is an IP address and no explicit --sni was provided. SNI-sensitive findings may be less reliable."
   fi
-  printf "  ${BOLD}Confidence${NC}    %3s%%  ${DIM}%s${NC}" "$CONFIDENCE_SCORE" "$CONFIDENCE_LABEL"
+  printf "  ${BOLD}%s${NC}    %3s%%  ${DIM}%s${NC}" "$(t confidence)" "$CONFIDENCE_SCORE" "$CONFIDENCE_LABEL"
   if [[ -n "${CONFIDENCE_REASONS:-}" ]]; then
     printf " ${DIM}(reasons: %s)${NC}" "$CONFIDENCE_REASONS"
   fi
@@ -433,7 +435,10 @@ EOF
 
 emit_json() {
   local host="$1" port="$2" mode="$3" ip="$4" asn="$5" sni="$6" cert_extracted="${7:-0}"
-  build_payload_json "$host" "$port" "$mode" "$ip" "$asn" "$sni" "$cert_extracted" | python3 "${SCRIPT_DIR}/protocol_infer.py" --enrich
+  local payload
+  payload=$(build_payload_json "$host" "$port" "$mode" "$ip" "$asn" "$sni" "$cert_extracted")
+  payload=$(echo "$payload" | jq --arg lang "$LANG_MODE" '. + {lang: $lang}')
+  echo "$payload" | python3 "${SCRIPT_DIR}/protocol_infer.py" --enrich
 }
 
 print_inference_text() {
@@ -442,7 +447,10 @@ print_inference_text() {
   [[ -n "${cn:-}" ]] && cert_extracted=1
   local args=(--text)
   [[ $DEBUG_INFER -eq 1 ]] && args+=(--debug)
-  build_payload_json "$host" "$port" "tcp" "$ip" "$asn" "$sni" "$cert_extracted" | python3 "${SCRIPT_DIR}/protocol_infer.py" "${args[@]}"
+  local payload
+  payload=$(build_payload_json "$host" "$port" "tcp" "$ip" "$asn" "$sni" "$cert_extracted")
+  payload=$(echo "$payload" | jq --arg lang "$LANG_MODE" '. + {lang: $lang}')
+  echo "$payload" | python3 "${SCRIPT_DIR}/protocol_infer.py" "${args[@]}"
 }
 
 print_summary() {
@@ -451,9 +459,9 @@ print_summary() {
   [[ -n "${cn:-}" ]] && cert_extracted=1
   compute_confidence "tcp" "$host" "$sni" "$cert_extracted"
   echo
-  printf "  ${BOLD}Reachability${NC}  %3s%%  ${DIM}%s/%s pts${NC}\n" "$(pct "$REACH_PTS" "$REACH_MAX")" "$REACH_PTS" "$REACH_MAX"
-  printf "  ${BOLD}Camouflage${NC}    %3s%%  ${DIM}%s/%s pts${NC}\n" "$(pct "$CAMO_PTS" "$CAMO_MAX")" "$CAMO_PTS" "$CAMO_MAX"
-  printf "  ${BOLD}Exposure${NC}      %3s%%  ${DIM}%s/%s pts${NC}\n" "$(pct "$EXPO_PTS" "$EXPO_MAX")" "$EXPO_PTS" "$EXPO_MAX"
+  printf "  ${BOLD}%s${NC}  %3s%%  ${DIM}%s/%s pts${NC}\n" "$(t reachability)" "$(pct "$REACH_PTS" "$REACH_MAX")" "$REACH_PTS" "$REACH_MAX"
+  printf "  ${BOLD}%s${NC}    %3s%%  ${DIM}%s/%s pts${NC}\n" "$(t camouflage)" "$(pct "$CAMO_PTS" "$CAMO_MAX")" "$CAMO_PTS" "$CAMO_MAX"
+  printf "  ${BOLD}%s${NC}      %3s%%  ${DIM}%s/%s pts${NC}\n" "$(t exposure)" "$(pct "$EXPO_PTS" "$EXPO_MAX")" "$EXPO_PTS" "$EXPO_MAX"
   print_notes_and_confidence
 }
 
@@ -473,6 +481,7 @@ ${BOLD}OPTIONS${NC}
       --debug-infer          Show inference internals and ranked hypotheses
       --hardening-hints      Show hardening hints in the text output (default on)
       --recommend-fixes      Alias for --hardening-hints
+      --lang=ru|en           Output language for interpretation layer (default: en)
       --no-color             Plain output, no ANSI colors
   -h, --help                 Show this help
 
@@ -507,6 +516,8 @@ main() {
       --debug-infer) DEBUG_INFER=1; shift ;;
       --hardening-hints) SHOW_HINTS=1; shift ;;
       --recommend-fixes) SHOW_HINTS=1; RECOMMEND_FIXES=1; shift ;;
+      --lang=ru) LANG_MODE="ru"; shift ;;
+      --lang=en) LANG_MODE="en"; shift ;;
       --no-color) no_color; shift ;;
       -h|--help) usage; exit 0 ;;
       *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
@@ -532,7 +543,7 @@ main() {
     exit 0
   fi
 
-  require_cmds nmap openssl curl nc dig getent python3
+  require_cmds nmap openssl curl nc dig getent python3 jq
   print_banner "$host" "$port" "TCP / TLS" "$ip" "$asn" "$sni"
   run_tcp "$host" "$port" "$sni"
 

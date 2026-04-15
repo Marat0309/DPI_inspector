@@ -5,6 +5,61 @@ import json
 import sys
 from typing import Any
 
+LANG = "en"
+
+
+def tr(en: str, ru: str) -> str:
+    return ru if LANG == "ru" else en
+
+
+def _translate_reason(text: str) -> str:
+    if LANG != "ru":
+        return text
+    mapping = {
+        "ordinary HTTPS fallback page": "обычная HTTPS фолбэк-страница",
+        "public CA certificate": "сертификат от публичного УЦ",
+        "non-public or unusual certificate profile": "непубличный или нетипичный профиль сертификата",
+        "modern TLS stack": "современный стек TLS",
+        "usable TLS stack": "рабочий стек TLS",
+        "strong normal header profile": "сильный стандартный профиль заголовков",
+        "some normal header profile": "частично стандартный профиль заголовков",
+        "ALPN profile looks web-like (h2+h1)": "профиль ALPN выглядит как у веб-фронта (h2+h1)",
+        "partial ALPN web profile": "частично веб-профиль ALPN",
+        "plausible behavior on random paths": "правдоподобное поведение на случайных путях",
+        "CONNECT rejected like a normal web server": "CONNECT отклоняется как на обычном веб-сервере",
+        "no obvious WS transport exposure": "нет явной экспозиции WS-транспорта",
+        "no obvious gRPC transport exposure": "нет явной экспозиции gRPC-транспорта",
+        "combined normal-web behavior across path, CONNECT, and transport checks": "совокупно обычное веб-поведение по путям, CONNECT и транспортным проверкам",
+        "same-cert foreign/no-SNI broadness still widens scan surface": "широкий прием foreign/no-SNI с тем же сертификатом все равно расширяет поверхность сканирования",
+        "different/default cert on foreign/no-SNI is a stronger anomaly": "другой/дефолтный сертификат на foreign/no-SNI — более сильная аномалия",
+        "strict SNI behavior is common for ordinary web fronting": "строгое поведение SNI типично для обычного веб-фронта",
+        "foreign SNI receives a different/default certificate": "на foreign SNI возвращается другой/дефолтный сертификат",
+        "no-SNI receives a different/default certificate": "на no-SNI возвращается другой/дефолтный сертификат",
+        "combined broad-SNI behavior with alternate cert substantially increases surface": "комбинация широкого SNI и альтернативного сертификата заметно увеличивает поверхность",
+        "WS transport appears exposed": "WS-транспорт выглядит открытым",
+        "gRPC transport appears exposed": "gRPC-транспорт выглядит открытым",
+        "strict HTTP/2 gRPC semantics exposed": "обнаружена строгая gRPC-семантика HTTP/2",
+        "CONNECT accepted like a proxy": "CONNECT принимается как у прокси",
+        "random-path behavior looks selective/unusual": "поведение на случайных путях выглядит избирательным/нетипичным",
+        "broad SNI acceptance weakens 'ordinary front' confidence": "широкое принятие SNI снижает уверенность в версии «обычный фронт»",
+        "strict SNI handling narrows generic TLS scan surface": "строгая обработка SNI сужает общую TLS-поверхность сканирования",
+        "broad SNI/no-SNI accepted with same certificate": "широкий прием SNI/no-SNI с тем же сертификатом",
+        "broad SNI/no-SNI accepted with different/default certificate": "широкий прием SNI/no-SNI с другим/default-сертификатом",
+        "answers to foreign SNI": "отвечает на foreign SNI",
+        "answers without SNI": "отвечает без SNI",
+        "WS transport endpoint exposed": "WS транспортный endpoint открыт",
+        "strong gRPC transport semantics exposed": "обнаружена выраженная gRPC транспортная семантика",
+        "CONNECT accepted like a proxy": "CONNECT принимается как у прокси",
+        "weaker HTTPS header profile": "более слабый профиль HTTPS-заголовков",
+        "HTTP redirect behavior not ideal": "поведение HTTP-редиректа неидеально",
+        "older TLS profile": "устаревший профиль TLS",
+        "repeated weak gRPC hints": "повторяющиеся слабые признаки gRPC",
+        "weak gRPC hint combined with other anomalies": "слабый признак gRPC в сочетании с другими аномалиями",
+        "combined foreign-SNI + no-SNI acceptance widens surface": "комбинация foreign-SNI + no-SNI расширяет поверхность",
+        "broad SNI behavior appears alongside transport or web-profile anomalies": "широкое SNI-поведение наблюдается вместе с транспортными или веб-профильными аномалиями",
+    }
+    return mapping.get(text, text)
+
 
 def _sev(findings: dict[str, dict[str, Any]], *ids: str) -> str:
     for fid in ids:
@@ -56,9 +111,9 @@ def _add(bucket: dict[str, dict[str, Any]], key: str, pts: float, support: str |
     bucket.setdefault(key, {"score": 0.0, "supports": [], "against": []})
     bucket[key]["score"] += pts
     if support:
-        bucket[key]["supports"].append(support)
+        bucket[key]["supports"].append(_translate_reason(support))
     if against:
-        bucket[key]["against"].append(against)
+        bucket[key]["against"].append(_translate_reason(against))
 
 
 def _reason_factor(conf: int, supports: int, against: int) -> float:
@@ -138,7 +193,7 @@ def _surface_risk(findings: dict[str, dict[str, Any]]) -> dict[str, Any]:
         label = "high"
     elif score >= 3:
         label = "medium"
-    return {"score": score, "label": label, "reasons": reasons[:5]}
+    return {"score": score, "label": label, "reasons": [_translate_reason(x) for x in reasons[:5]]}
 
 
 def _hardening_hints(payload: dict[str, Any], findings: dict[str, dict[str, Any]]) -> list[str]:
@@ -160,22 +215,24 @@ def _hardening_hints(payload: dict[str, Any], findings: dict[str, dict[str, Any]
     )
 
     if _sev(findings, "http_redirect") == "notice":
-        hints.append("Port 80 does not cleanly redirect to HTTPS; add a 301 redirect.")
+        hints.append(tr("Port 80 does not cleanly redirect to HTTPS; add a 301 redirect.", "Порт 80 не делает чистый редирект на HTTPS; добавьте 301 редирект."))
     if _sev(findings, "headers") == "notice":
-        hints.append("Add HSTS on the HTTPS server block to strengthen the web profile.")
+        hints.append(tr("Add HSTS on the HTTPS server block to strengthen the web profile.", "Добавьте HSTS в HTTPS server block, чтобы усилить веб-профиль."))
     tls_surface, _ = _tls_surface_class(findings)
     if tls_surface == "same_cert_broad_front":
-        hints.append("Same cert is served on foreign/no-SNI; tighten unknown-SNI/default vhost handling to reduce broad scan surface.")
+        hints.append(tr("Same cert is served on foreign/no-SNI; tighten unknown-SNI/default vhost handling to reduce broad scan surface.", "На foreign/no-SNI отдается тот же сертификат; ужесточите обработку unknown-SNI/default vhost, чтобы сузить поверхность."))
     elif tls_surface == "default_cert_broad_front":
-        hints.append("Foreign/no-SNI returns another cert; review default certificate and default-server routing first.")
+        hints.append(tr("Foreign/no-SNI returns another cert; review default certificate and default-server routing first.", "На foreign/no-SNI возвращается другой сертификат; сначала проверьте default-сертификат и маршрутизацию default-server."))
     elif _sev(findings, "foreign_sni", "mismatched_sni") == "risk" or _sev(findings, "no_sni") == "risk":
-        hints.append("Tighten the default server / unknown-SNI handling, ideally dropping unmatched SNI.")
+        hints.append(tr("Tighten the default server / unknown-SNI handling, ideally dropping unmatched SNI.", "Ужесточите обработку default server / unknown-SNI, в идеале отбрасывайте несовпавший SNI."))
     if is_domain and hints and (recommend_fixes or ("nginx" in banner and not edge_like)):
-        hints.append(f"For nginx targets, review harden_nginx.sh {host} --dry-run before applying changes.")
+        hints.append(tr(f"For nginx targets, review harden_nginx.sh {host} --dry-run before applying changes.", f"Для nginx-целей проверьте harden_nginx.sh {host} --dry-run перед применением изменений."))
     return hints[:4]
 
 
 def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    global LANG
+    LANG = str(payload.get("lang", "en"))
     findings_list = payload.get("findings", [])
     findings = {f.get("id", f.get("title", str(i))): f for i, f in enumerate(findings_list)}
     mode = payload.get("target", {}).get("mode", "")
@@ -437,16 +494,16 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
             _add(scores, "no_clear_tunnel_evidence", -0.08, against="default/alternate cert broadness is a suspicious TLS surface")
 
     labels = {
-        "ordinary_web_front": {"label": "Ordinary web front", "examples": ["nginx/apache/caddy style HTTPS site"]},
+        "ordinary_web_front": {"label": tr("Ordinary web front", "Обычный веб-фронт"), "examples": [tr("nginx/apache/caddy style HTTPS site", "HTTPS-сайт в стиле nginx/apache/caddy")]},
         "default_cert_tls_front": {"label": "Default/shared-cert TLS front", "examples": ["default nginx vhost", "shared caddy cert front"]},
         "broad_tls_front": {"label": "Broad TLS front", "examples": ["wide-SNI TLS front", "generic HTTPS terminator"]},
-        "tls_camouflage_relay": {"label": "TLS camouflage relay", "examples": ["Reality-like", "ShadowTLS-like", "Trojan-like"]},
+        "tls_camouflage_relay": {"label": tr("TLS camouflage relay", "TLS-ретранслятор с маскировкой"), "examples": ["Reality-like", "ShadowTLS-like", "Trojan-like"]},
         "exposed_v2ray_transport": {"label": "Exposed V2Ray-style transport", "examples": ["WS transport", "gRPC transport", "HTTP/2 transport"]},
         "http_tunneling_front": {"label": "HTTP tunneling / browser-like front", "examples": ["NaiveProxy-like", "WebTunnel-like", "MASQUE-like"]},
         "cdn_or_reverse_proxy_front": {"label": "CDN / reverse-proxy-like front", "examples": ["Cloudflare-like edge", "reverse-proxy edge front"]},
         "quic_relay": {"label": "QUIC relay family", "examples": ["Hysteria2-like", "TUIC-like", "QUIC transport"]},
         "direct_http_proxy": {"label": "Direct HTTP proxy semantics", "examples": ["CONNECT proxy"]},
-        "no_clear_tunnel_evidence": {"label": "Ordinary web service with no clear tunnel evidence", "examples": ["normal site / web app"]},
+        "no_clear_tunnel_evidence": {"label": tr("Ordinary web service with no clear tunnel evidence", "Обычный веб-сервис без явных признаков туннеля"), "examples": [tr("normal site / web app", "обычный сайт / веб-приложение")]},
     }
 
     hypotheses: list[dict[str, Any]] = []
@@ -476,7 +533,7 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 h["score"] = round(max(0.0, h["score"] * 0.85), 3)
                 if h["confidence"] == "high":
                     h["confidence"] = "medium"
-                h["against"] = (h.get("against", []) + ["broad SNI acceptance weakens 'ordinary front' confidence"])[:5]
+                h["against"] = (h.get("against", []) + [_translate_reason("broad SNI acceptance weakens 'ordinary front' confidence")])[:5]
                 break
         hypotheses.sort(key=lambda x: x["score"], reverse=True)
 
@@ -489,39 +546,39 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
             if foreign_open and nosni_open and conf_label == "high":
                 conf_label = "medium"
             overall = {
-                "label": "Looks like an ordinary web service with no clear tunnel evidence",
+                "label": tr("Looks like an ordinary web service with no clear tunnel evidence", "Похоже на обычный веб-сервис без явных признаков туннеля"),
                 "confidence": conf_label,
-                "caution": "This does not prove the absence of VPN/proxy use; it only means current probes did not surface clear tunnel indicators.",
+                "caution": tr("This does not prove the absence of VPN/proxy use; it only means current probes did not surface clear tunnel indicators.", "Это не доказывает отсутствие VPN/прокси; текущие пробы просто не выявили явных индикаторов туннеля."),
             }
         elif top["family"] in {"ordinary_web_front", "no_clear_tunnel_evidence"}:
-            ordinary_label = "Looks like an ordinary web service with no clear tunnel evidence"
-            ordinary_caution = "Current probes mostly match regular HTTPS behavior; this is still a family-level inference."
+            ordinary_label = tr("Looks like an ordinary web service with no clear tunnel evidence", "Похоже на обычный веб-сервис без явных признаков туннеля")
+            ordinary_caution = tr("Current probes mostly match regular HTTPS behavior; this is still a family-level inference.", "Текущие пробы в основном соответствуют обычному HTTPS-поведению; это все еще вывод на уровне семейства.")
             if tls_surface == "same_cert_broad_front":
-                ordinary_label = "Ordinary web front with same-cert broad TLS surface"
-                ordinary_caution = "Same-cert broadness widens probe surface, but is softer than default-cert broadness."
+                ordinary_label = tr("Ordinary web front with same-cert broad TLS surface", "Обычный веб-фронт с широкой TLS-поверхностью и тем же сертификатом")
+                ordinary_caution = tr("Same-cert broadness widens probe surface, but is softer than default-cert broadness.", "Широкая поверхность с тем же сертификатом расширяет поверхность проб, но мягче, чем вариант с default-сертификатом.")
             elif tls_surface == "default_cert_broad_front":
-                ordinary_label = "Ordinary web front with default-cert broad TLS surface"
-                ordinary_caution = "Default/alternate cert behavior is a stronger TLS-surface anomaly and should be reviewed."
+                ordinary_label = tr("Ordinary web front with default-cert broad TLS surface", "Обычный веб-фронт с широкой TLS-поверхностью и default-сертификатом")
+                ordinary_caution = tr("Default/alternate cert behavior is a stronger TLS-surface anomaly and should be reviewed.", "Поведение с default/альтернативным сертификатом — более сильная аномалия TLS-поверхности и требует проверки.")
             elif tls_surface == "strict_sni_front":
-                ordinary_label = "Ordinary web front with strict SNI handling"
-                ordinary_caution = "Strict SNI handling generally reduces generic scan surface."
+                ordinary_label = tr("Ordinary web front with strict SNI handling", "Обычный веб-фронт со строгой обработкой SNI")
+                ordinary_caution = tr("Strict SNI handling generally reduces generic scan surface.", "Строгая обработка SNI обычно снижает общую поверхность сканирования.")
             overall = {
                 "label": ordinary_label,
                 "confidence": top["confidence"],
                 "caution": ordinary_caution,
             }
         elif top["family"] in {"broad_tls_front", "default_cert_tls_front"}:
-            broad_label = "Ordinary web front with broad TLS surface"
-            broad_caution = "Broad SNI acceptance increases scan surface but is not, by itself, proof of relay usage."
+            broad_label = tr("Ordinary web front with broad TLS surface", "Обычный веб-фронт с широкой TLS-поверхностью")
+            broad_caution = tr("Broad SNI acceptance increases scan surface but is not, by itself, proof of relay usage.", "Широкое принятие SNI увеличивает поверхность сканирования, но само по себе не доказывает использование релея.")
             if tls_surface == "same_cert_broad_front":
-                broad_label = "Ordinary web front with same-cert broad TLS surface"
-                broad_caution = "Same-cert broadness is softer than default-cert broadness, but still widens probe surface."
+                broad_label = tr("Ordinary web front with same-cert broad TLS surface", "Обычный веб-фронт с широкой TLS-поверхностью и тем же сертификатом")
+                broad_caution = tr("Same-cert broadness is softer than default-cert broadness, but still widens probe surface.", "Вариант с тем же сертификатом мягче default-cert сценария, но все равно расширяет поверхность проб.")
             elif tls_surface == "default_cert_broad_front":
-                broad_label = "Ordinary web front with default-cert broad TLS surface"
-                broad_caution = "Default/alternate cert behavior under foreign/no-SNI is a stronger suspicious surface signal."
+                broad_label = tr("Ordinary web front with default-cert broad TLS surface", "Обычный веб-фронт с широкой TLS-поверхностью и default-сертификатом")
+                broad_caution = tr("Default/alternate cert behavior under foreign/no-SNI is a stronger suspicious surface signal.", "Поведение default/альтернативного сертификата под foreign/no-SNI — более сильный подозрительный сигнал поверхности.")
             elif tls_surface == "strict_sni_front":
-                broad_label = "Ordinary web front with strict SNI handling"
-                broad_caution = "Strict SNI handling reduces generic TLS scan surface."
+                broad_label = tr("Ordinary web front with strict SNI handling", "Обычный веб-фронт со строгой обработкой SNI")
+                broad_caution = tr("Strict SNI handling reduces generic TLS scan surface.", "Строгая обработка SNI снижает общую TLS-поверхность сканирования.")
             overall = {
                 "label": broad_label,
                 "confidence": top["confidence"],
@@ -529,21 +586,21 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
             }
         elif top["family"] == "cdn_or_reverse_proxy_front":
             overall = {
-                "label": "Looks like a CDN or reverse-proxy-style web edge",
+                "label": tr("Looks like a CDN or reverse-proxy-style web edge", "Похоже на веб-edge в стиле CDN или reverse-proxy"),
                 "confidence": top["confidence"],
-                "caution": "Edge-like web behavior can be normal for third-party fronting and is not tunnel evidence by itself.",
+                "caution": tr("Edge-like web behavior can be normal for third-party fronting and is not tunnel evidence by itself.", "Веб-поведение в стиле edge может быть нормальным для стороннего фронтирования и само по себе не является признаком туннеля."),
             }
         elif top["family"] == "tls_camouflage_relay":
             overall = {
-                "label": "Plausible TLS-camouflaged relay/front",
+                "label": tr("Plausible TLS-camouflaged relay/front", "Вероятный TLS-замаскированный релей/фронт"),
                 "confidence": top["confidence"],
-                "caution": "This remains a family-level hypothesis, not a product-level identification.",
+                "caution": tr("This remains a family-level hypothesis, not a product-level identification.", "Это остается гипотезой на уровне семейства, а не идентификацией конкретного продукта."),
             }
         elif top["family"] in {"exposed_v2ray_transport", "direct_http_proxy", "quic_relay"}:
             overall = {
-                "label": "Tunnel/proxy-like surface characteristics are present",
+                "label": tr("Tunnel/proxy-like surface characteristics are present", "Присутствуют характеристики поверхности, похожие на туннель/прокси"),
                 "confidence": top["confidence"],
-                "caution": "Interpretation depends on how specific the exposed semantics are.",
+                "caution": tr("Interpretation depends on how specific the exposed semantics are.", "Интерпретация зависит от того, насколько специфична обнаруженная семантика."),
             }
 
     return {
@@ -564,46 +621,46 @@ def render_text(inference: dict[str, Any]) -> str:
         return ""
     top = hyps[0]
     pct = int(round(top["score"] * 100))
-    lines = ["  Protocol hypotheses", f"  Top: {top['label']} ({pct}% / {top['confidence']})"]
+    lines = [f"  {tr('Protocol hypotheses', 'Гипотезы протоколов')}", f"  Top: {top['label']} ({pct}% / {top['confidence']})"]
     examples = ", ".join(top.get("examples", [])[:3])
     if examples:
         lines.append(f"  Examples: {examples}")
     if top.get("supports"):
-        lines.append("  Supports:")
+        lines.append(f"  {tr('Supports', 'Поддерживают')}:")
         for reason in top["supports"][:4]:
             lines.append(f"    - {reason}")
     if top.get("against"):
-        lines.append("  Against:")
+        lines.append(f"  {tr('Against', 'Против')}:")
         for reason in top["against"][:3]:
             lines.append(f"    - {reason}")
     others = hyps[1:3]
     if others:
-        lines.append("  Other plausible families:")
+        lines.append(f"  {tr('Other plausible families', 'Другие правдоподобные семейства')}:")
         for h in others:
             lines.append(f"    - {h['label']}: {int(round(h['score'] * 100))}% ({h['confidence']})")
     surface = inference.get("surface_risk")
     tls_surface = inference.get("tls_surface_class")
     if tls_surface:
-        lines.append("  TLS surface class:")
+        lines.append(f"  {tr('TLS surface class', 'Класс TLS-поверхности')}:")
         lines.append(f"    {tls_surface.get('id')}")
     cert_profile = inference.get("cert_routing_profile")
     if cert_profile:
-        lines.append("  Cert routing profile:")
+        lines.append(f"  {tr('Cert routing profile', 'Профиль маршрутизации сертификата')}:")
         lines.append(f"    {cert_profile}")
     if surface:
-        lines.append("  Surface risk:")
+        lines.append(f"  {tr('Surface risk', 'Риск поверхности')}:")
         lines.append(f"    {surface['label']} (score {surface['score']})")
         if surface.get("reasons"):
-            lines.append(f"    because: {', '.join(surface['reasons'][:3])}")
+            lines.append(f"    {tr('because', 'потому что')}: {', '.join(surface['reasons'][:3])}")
     overall = inference.get("overall_assessment")
     if overall:
-        lines.append("  Overall assessment:")
+        lines.append(f"  {tr('Overall assessment', 'Общая оценка')}:")
         lines.append(f"    {overall['label']} ({overall['confidence']})")
         if overall.get("caution"):
-            lines.append(f"    note: {overall['caution']}")
+            lines.append(f"    {tr('note', 'примечание')}: {overall['caution']}")
     hints = inference.get("hardening_hints") or []
     if hints:
-        lines.append("  Hardening hints:")
+        lines.append(f"  {tr('Hardening hints', 'Рекомендации по защите')}:")
         for hint in hints[:4]:
             lines.append(f"    - {hint}")
     return "\n".join(lines)
