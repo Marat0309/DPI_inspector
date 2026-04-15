@@ -176,6 +176,8 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
         _add(scores, "ordinary_web_front", -0.10, against="answers without SNI")
     if foreign_open and nosni_open:
         _add(scores, "ordinary_web_front", -0.12, against="combined broad-SNI behavior increases scan surface")
+    if foreign_open and nosni_open and modern_tls and headers_strong and strong_web:
+        _add(scores, "ordinary_web_front", -0.08, against="high-fidelity web camouflage with broad SNI surface can indicate intentional fronting")
     if ws_exposed:
         _add(scores, "ordinary_web_front", -0.18, against="WS transport appears exposed")
     if grpc_exposed:
@@ -200,6 +202,8 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
             _add(scores, "broad_tls_front", 0.08, "accepts no-SNI clients")
         if foreign_open and nosni_open:
             _add(scores, "broad_tls_front", 0.08, "combined foreign-SNI + no-SNI acceptance")
+        if foreign_open and nosni_open and modern_tls and headers_strong and strong_web:
+            _add(scores, "broad_tls_front", 0.08, "strong web mimic + broad SNI acceptance pattern")
         if cert_non_public:
             _add(scores, "broad_tls_front", 0.04, "certificate profile is less typical for mainstream web")
         if connect_rejected:
@@ -225,6 +229,8 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
             _add(scores, "tls_camouflage_relay", 0.07, "accepts no-SNI clients")
         if foreign_open and nosni_open:
             _add(scores, "tls_camouflage_relay", 0.10, "combined broad-SNI behavior")
+        if foreign_open and nosni_open and modern_tls and headers_strong and strong_web:
+            _add(scores, "tls_camouflage_relay", 0.09, "strong web camouflage with broad SNI/no-SNI acceptance")
         if cert_non_public:
             _add(scores, "tls_camouflage_relay", 0.08, "non-public or unusual certificate profile")
         if not ws_exposed and not grpc_exposed:
