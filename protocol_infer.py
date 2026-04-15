@@ -35,47 +35,82 @@ def _reason_factor(conf: int, supports: int, against: int) -> float:
     return max(0.38, factor)
 
 
+def _is_probably_cdn_front(payload: dict[str, Any], findings: dict[str, dict[str, Any]]) -> bool:
+    asn = str(payload.get("target", {}).get("asn", "")).lower()
+    host = str(payload.get("target", {}).get("host", "")).lower()
+    hdr = _obs(findings, "headers").lower()
+    cdn_tokens = (
+        "cloudflare", "cloudfront", "fastly", "akamai", "edgecast",
+        "ddos-guard", "incapsula", "sucuri", "stackpath", "cachefly", "imperva",
+    )
+    if any(t in asn for t in cdn_tokens):
+        return True
+    if any(t in hdr for t in cdn_tokens):
+        return True
+    if host.endswith(".cdn.cloudflare.net"):
+        return True
+    return False
+
+
 def _surface_risk(findings: dict[str, dict[str, Any]]) -> dict[str, Any]:
     score = 0
     reasons: list[str] = []
-    if _sev(findings, "foreign_sni", "mismatched_sni") == "risk":
+    foreign_open = _sev(findings, "foreign_sni", "mismatched_sni") == "risk"
+    nosni_open = _sev(findings, "no_sni") == "risk"
+    broad_sni = foreign_open and nosni_open
+    if broad_sni:
+        score += 3
+        reasons.append("broad SNI surface (foreign-SNI + no-SNI accepted)")
+    elif foreign_open or nosni_open:
         score += 2
-        reasons.append("answers to foreign SNI")
-    if _sev(findings, "no_sni") == "risk":
-        score += 2
-        reasons.append("answers without SNI")
+        reasons.append("partially broad SNI surface")
+
+    escalation = 0
     if _sev(findings, "ws_leak") == "risk":
+        escalation += 1
         score += 3
         reasons.append("WS transport endpoint exposed")
     if _sev(findings, "grpc_leak") == "risk":
+        escalation += 1
         score += 3
         reasons.append("strong gRPC transport semantics exposed")
     elif _sev(findings, "grpc_leak") == "notice":
+        escalation += 1
         score += 1
         reasons.append("weak gRPC hint")
     if _sev(findings, "grpc_strict_probe") == "risk":
+        escalation += 1
         score += 4
         reasons.append("strict HTTP/2 gRPC semantics exposed")
     elif _sev(findings, "grpc_strict_probe") == "notice":
+        escalation += 1
         score += 1
         reasons.append("partial strict gRPC hint")
     if _sev(findings, "http_connect") == "risk":
+        escalation += 1
         score += 3
         reasons.append("CONNECT accepted like a proxy")
     if _sev(findings, "headers") == "notice":
+        escalation += 1
         score += 1
         reasons.append("weaker HTTPS header profile")
     if _sev(findings, "http_redirect") == "notice":
+        escalation += 1
         score += 1
         reasons.append("HTTP redirect behavior not ideal")
     if _sev(findings, "tls_profile") == "notice":
         score += 1
         reasons.append("older TLS profile")
+
     label = "low"
-    if score >= 6:
+    if score >= 7:
         label = "high"
     elif score >= 3:
         label = "medium"
+    if broad_sni and escalation == 0 and label == "high":
+        label = "medium"
+    if broad_sni and escalation == 0 and score > 5:
+        score = 5
     return {"score": score, "label": label, "reasons": reasons[:5]}
 
 
@@ -83,14 +118,16 @@ def _hardening_hints(payload: dict[str, Any], findings: dict[str, dict[str, Any]
     hints: list[str] = []
     target = payload.get("target", {})
     host = str(target.get("host", ""))
+    recommend_fixes = bool(target.get("recommend_fixes", False))
     is_domain = host and not host.replace(".", "").isdigit() and ":" not in host
+    cdn_like = _is_probably_cdn_front(payload, findings)
     if _sev(findings, "http_redirect") == "notice":
         hints.append("Port 80 does not cleanly redirect to HTTPS; add a 301 redirect.")
     if _sev(findings, "headers") == "notice":
         hints.append("Add HSTS on the HTTPS server block to strengthen the web profile.")
     if _sev(findings, "foreign_sni", "mismatched_sni") == "risk" or _sev(findings, "no_sni") == "risk":
         hints.append("Tighten the default server / unknown-SNI handling, ideally dropping unmatched SNI.")
-    if is_domain and hints:
+    if is_domain and hints and (recommend_fixes or not cdn_like):
         hints.append(f"For nginx targets, review harden_nginx.sh {host} --dry-run before applying changes.")
     return hints[:4]
 
@@ -126,6 +163,8 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
     nosni_open = _sev(findings, "no_sni") == "risk"
     quic_ok = _sev(findings, "quic_handshake") == "ok"
     udp_junk_silent = _sev(findings, "raw_udp") == "ok"
+    redirect_weak = _sev(findings, "http_redirect") == "notice"
+    cdn_like = _is_probably_cdn_front(payload, findings)
 
     strong_negative = 0
     if connect_rejected:
@@ -143,7 +182,7 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     # Ordinary web front
     if web_ok:
-        _add(scores, "ordinary_web_front", 0.24, "ordinary HTTPS fallback page")
+        _add(scores, "ordinary_web_front", 0.26, "ordinary HTTPS fallback page")
     if public_cert:
         _add(scores, "ordinary_web_front", 0.16, "public CA certificate")
     elif cert_non_public:
@@ -169,13 +208,17 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if not grpc_exposed and not grpc_strict_exposed:
         _add(scores, "ordinary_web_front", 0.07, "no obvious gRPC transport exposure")
     if strong_web and connect_rejected and not ws_exposed and not grpc_exposed and public_cert:
-        _add(scores, "ordinary_web_front", 0.14, "combined normal-web behavior across path, CONNECT, and transport checks")
+        _add(scores, "ordinary_web_front", 0.20, "combined normal-web behavior across path, CONNECT, and transport checks")
+    if web_ok and strong_web and connect_rejected and not ws_exposed and not grpc_exposed and not grpc_strict_exposed and (public_cert or usable_tls) and headers_some:
+        _add(scores, "ordinary_web_front", 0.18, "stacked ordinary-web evidence across fallback/path/connect/transport/cert/headers")
     if foreign_open:
-        _add(scores, "ordinary_web_front", -0.14, against="answers to foreign SNI")
+        _add(scores, "ordinary_web_front", -0.08, against="answers to foreign SNI")
     if nosni_open:
-        _add(scores, "ordinary_web_front", -0.10, against="answers without SNI")
+        _add(scores, "ordinary_web_front", -0.06, against="answers without SNI")
     if foreign_open and nosni_open:
-        _add(scores, "ordinary_web_front", -0.12, against="combined broad-SNI behavior increases scan surface")
+        _add(scores, "ordinary_web_front", -0.06, against="combined broad-SNI behavior increases scan surface")
+    if foreign_open and nosni_open and (grpc_hint or grpc_strict_hint or connect_accepted):
+        _add(scores, "ordinary_web_front", -0.12, against="broad SNI with additional tunnel-like indicators")
     if ws_exposed:
         _add(scores, "ordinary_web_front", -0.18, against="WS transport appears exposed")
     if grpc_exposed:
@@ -200,6 +243,8 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
             _add(scores, "broad_tls_front", 0.08, "accepts no-SNI clients")
         if foreign_open and nosni_open:
             _add(scores, "broad_tls_front", 0.08, "combined foreign-SNI + no-SNI acceptance")
+        if foreign_open and nosni_open and modern_tls and strong_web and (grpc_hint or redirect_weak or not headers_strong):
+            _add(scores, "broad_tls_front", 0.07, "broad SNI plus additional non-ordinary web signals")
         if cert_non_public:
             _add(scores, "broad_tls_front", 0.04, "certificate profile is less typical for mainstream web")
         if connect_rejected:
@@ -225,9 +270,10 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
             _add(scores, "tls_camouflage_relay", 0.07, "accepts no-SNI clients")
         if foreign_open and nosni_open:
             _add(scores, "tls_camouflage_relay", 0.10, "combined broad-SNI behavior")
+        if foreign_open and nosni_open and (grpc_hint or grpc_strict_hint or connect_accepted):
+            _add(scores, "tls_camouflage_relay", 0.09, "broad SNI with weak tunnel-like hints")
         if cert_non_public:
             _add(scores, "tls_camouflage_relay", 0.08, "non-public or unusual certificate profile")
-        if not ws_exposed and not grpc_exposed and not grpc_strict_exposed:
         if not ws_exposed and not grpc_exposed:
             _add(scores, "tls_camouflage_relay", 0.05, "no exposed WS/gRPC transport paths")
         if strong_web:
@@ -286,6 +332,10 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
             _add(scores, "quic_relay", 0.06, "answers without SNI over QUIC")
         if h3:
             _add(scores, "quic_relay", 0.06, "QUIC / H3 style transport surface")
+        if not foreign_open and not nosni_open and public_cert:
+            _add(scores, "cdn_or_reverse_proxy_front", 0.18, "strict SNI handling with public cert over QUIC")
+        if _obs(findings, "headers") and any(t in _obs(findings, "headers").lower() for t in ("cloudflare", "akamai", "fastly")):
+            _add(scores, "cdn_or_reverse_proxy_front", 0.24, "edge/CDN-like header signature")
 
     if connect_accepted:
         _add(scores, "direct_http_proxy", 0.70, "CONNECT explicitly accepted")
@@ -294,19 +344,27 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     # Ordinary site with no clear tunnel evidence
     if mode == "tcp" and strong_negative >= 5 and not connect_accepted and not ws_exposed and not grpc_exposed and not grpc_strict_exposed:
-        _add(scores, "no_clear_tunnel_evidence", 0.46, "normal web behavior with no exposed tunnel endpoints")
+        _add(scores, "no_clear_tunnel_evidence", 0.30, "normal web behavior with no exposed tunnel endpoints")
         if public_cert:
-            _add(scores, "no_clear_tunnel_evidence", 0.12, "credible public certificate")
+            _add(scores, "no_clear_tunnel_evidence", 0.08, "credible public certificate")
         if connect_rejected:
-            _add(scores, "no_clear_tunnel_evidence", 0.10, "CONNECT rejected")
+            _add(scores, "no_clear_tunnel_evidence", 0.06, "CONNECT rejected")
         if strong_web:
-            _add(scores, "no_clear_tunnel_evidence", 0.10, "random-path behavior looks like a normal site")
+            _add(scores, "no_clear_tunnel_evidence", 0.06, "random-path behavior looks like a normal site")
         if headers_some:
-            _add(scores, "no_clear_tunnel_evidence", 0.06, "normal HTTPS header surface")
+            _add(scores, "no_clear_tunnel_evidence", 0.04, "normal HTTPS header surface")
         if foreign_open:
-            _add(scores, "no_clear_tunnel_evidence", -0.05, against="still answers broadly on foreign SNI")
+            _add(scores, "no_clear_tunnel_evidence", -0.04, against="still answers broadly on foreign SNI")
         if nosni_open:
-            _add(scores, "no_clear_tunnel_evidence", -0.04, against="still answers without SNI")
+            _add(scores, "no_clear_tunnel_evidence", -0.03, against="still answers without SNI")
+
+    if mode == "tcp":
+        if cdn_like and headers_some and not foreign_open and not nosni_open and connect_rejected:
+            _add(scores, "cdn_or_reverse_proxy_front", 0.42, "edge/CDN-like front with strict SNI behavior")
+            if web_ok:
+                _add(scores, "cdn_or_reverse_proxy_front", 0.10, "usable HTTPS fallback through edge front")
+        if cdn_like and foreign_open and nosni_open:
+            _add(scores, "cdn_or_reverse_proxy_front", -0.10, against="broad SNI behavior is less typical for managed CDN fronts")
 
     labels = {
         "ordinary_web_front": {"label": "Ordinary web front", "examples": ["nginx/apache/caddy style HTTPS site"]},
@@ -317,6 +375,7 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "quic_relay": {"label": "QUIC relay family", "examples": ["Hysteria2-like", "TUIC-like", "QUIC transport"]},
         "direct_http_proxy": {"label": "Direct HTTP proxy semantics", "examples": ["CONNECT proxy"]},
         "no_clear_tunnel_evidence": {"label": "Ordinary web service with no clear tunnel evidence", "examples": ["normal site / web app"]},
+        "cdn_or_reverse_proxy_front": {"label": "CDN / reverse-proxy front", "examples": ["Cloudflare-like edge", "managed reverse proxy"]},
     }
 
     hypotheses: list[dict[str, Any]] = []
@@ -340,7 +399,7 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     hypotheses.sort(key=lambda x: x["score"], reverse=True)
 
-    if foreign_open and nosni_open:
+    if foreign_open and nosni_open and (grpc_hint or grpc_strict_hint or connect_accepted or redirect_weak):
         for h in hypotheses:
             if h["family"] == "ordinary_web_front":
                 h["score"] = round(max(0.0, h["score"] * 0.82), 3)
@@ -350,11 +409,16 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 break
         hypotheses.sort(key=lambda x: x["score"], reverse=True)
 
+    ord_h = next((h for h in hypotheses if h["family"] == "ordinary_web_front"), None)
+    no_clear_h = next((h for h in hypotheses if h["family"] == "no_clear_tunnel_evidence"), None)
+    if ord_h and no_clear_h and ord_h["score"] >= no_clear_h["score"]:
+        no_clear_h["score"] = round(max(0.0, no_clear_h["score"] * 0.88), 3)
+        hypotheses.sort(key=lambda x: x["score"], reverse=True)
+
     top = hypotheses[0] if hypotheses else None
 
     overall = None
     if top:
-        if top["family"] in {"ordinary_web_front", "no_clear_tunnel_evidence"} and top["score"] >= 0.60 and not ws_exposed and not grpc_exposed and not grpc_strict_exposed and not connect_accepted and not (foreign_open and nosni_open):
         if top["family"] in {"ordinary_web_front", "no_clear_tunnel_evidence"} and top["score"] >= 0.60 and not ws_exposed and not grpc_exposed and not grpc_strict_exposed and not connect_accepted and not (foreign_open and nosni_open):
             conf_label = top["confidence"]
             if foreign_open and nosni_open and conf_label == "high":
@@ -381,6 +445,12 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "label": "Tunnel/proxy-like surface characteristics are present",
                 "confidence": top["confidence"],
                 "caution": "Interpretation depends on how specific the exposed semantics are.",
+            }
+        elif top["family"] == "cdn_or_reverse_proxy_front":
+            overall = {
+                "label": "Looks like a CDN / reverse-proxy edge front",
+                "confidence": top["confidence"],
+                "caution": "Edge-like behavior can look unusual but is often legitimate hosting architecture.",
             }
 
     return {

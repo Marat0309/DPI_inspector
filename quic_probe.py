@@ -15,6 +15,7 @@ import ssl
 import subprocess
 import sys
 import time
+from pathlib import Path
 from datetime import datetime, timezone
 
 try:
@@ -68,13 +69,47 @@ class Score:
 
 
 # ── Row printer ───────────────────────────────────────────────
+PROBE_ROWS: list[dict] = []
+
+
 def print_row(c: Colors, sc: Score, num: int, label: str, detail: str, verdict: str):
     sym = {'pass': c.pass_sym(), 'warn': c.warn_sym(),
            'fail': c.fail_sym(), 'info': c.info_sym()}.get(verdict, c.info_sym())
     sc.add(verdict)
     detail = (detail[:34] + '…') if len(detail) > 35 else detail
+    PROBE_ROWS.append({"label": label, "detail": detail, "verdict": verdict})
     if not c.silent:
         print(f"  {c.DIM}[{num:2d}]{c.NC}  {c.W}{label:<22}{c.NC}  {c.DIM}→{c.NC}  {detail:<36}  {sym}")
+
+
+def _severity_from_verdict(verdict: str) -> str:
+    return {"pass": "ok", "warn": "notice", "fail": "risk"}.get(verdict, "notice")
+
+
+def _build_findings(rows: list[dict]) -> list[dict]:
+    mapping = {
+        "UDP port scan": ("port_scan", "reachability", "UDP port scan", "UDP reachability signal for QUIC mode."),
+        "Raw UDP (junk)": ("raw_udp", "exposure", "Raw UDP (junk)", "Raw UDP response profile."),
+        "QUIC handshake": ("quic_handshake", "reachability", "QUIC handshake", "QUIC handshake behavior."),
+        "TLS certificate": ("quic_cert", "camouflage", "TLS certificate", "Certificate profile over QUIC."),
+        "Mismatched SNI": ("foreign_sni", "exposure", "Foreign SNI behavior", "Behavior under foreign SNI."),
+        "No SNI probe": ("no_sni", "exposure", "No-SNI behavior", "Behavior without SNI."),
+        "HTTP/3 fallback": ("http3", "camouflage", "HTTP/3 fallback", "HTTP/3 fallback behavior."),
+    }
+    findings: list[dict] = []
+    for row in rows:
+        if row["label"] not in mapping:
+            continue
+        fid, cat, title, impact = mapping[row["label"]]
+        findings.append({
+            "id": fid,
+            "category": cat,
+            "title": title,
+            "severity": _severity_from_verdict(row["verdict"]),
+            "observed": row["detail"],
+            "impact": impact,
+        })
+    return findings
 
 
 def div(c: Colors):
@@ -393,6 +428,7 @@ async def main():
     use_color = not args.no_color
     c  = Colors(use_color and sys.stdout.isatty(), silent=args.json)
     sc = Score()
+    PROBE_ROWS.clear()
 
     if not args.json:
         header(c, "UDP / QUIC CHECKS")
@@ -407,13 +443,50 @@ async def main():
     await probe_http3(c, sc, host, port, sni, timeout)
     await probe_port_hopping(c, sc, host, timeout)
 
+    findings = _build_findings(PROBE_ROWS)
+    payload = {
+        "target": {"host": host, "port": port, "sni": sni, "mode": "udp", "recommend_fixes": False},
+        "confidence": {"score": 100, "label": "high", "reasons": ""},
+        "findings": findings,
+    }
+    infer_script = Path(__file__).resolve().with_name("protocol_infer.py")
+    inference = None
+    try:
+        infer_out = subprocess.run(
+            [sys.executable, str(infer_script)],
+            input=json.dumps(payload, ensure_ascii=False),
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=True,
+        )
+        inference = json.loads(infer_out.stdout)
+    except Exception:
+        inference = None
+
     if args.json:
         print(json.dumps({
             "target": {"host": host, "port": port, "sni": sni, "mode": "udp"},
             "score": {"pts": sc.pts, "max": sc.max, "pct": sc.pct()},
+            "findings": findings,
+            "protocol_inference": inference,
         }, ensure_ascii=False))
     else:
         print_summary(c, sc)
+        if inference:
+            try:
+                text_out = subprocess.run(
+                    [sys.executable, str(infer_script), "--text"] + (["--debug"] if args.debug else []),
+                    input=json.dumps(payload, ensure_ascii=False),
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                    check=True,
+                ).stdout.strip()
+                if text_out:
+                    print(text_out)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ OUTPUT_MODE="text"
 SNI_EXPLICIT=0
 DEBUG_INFER=0
 SHOW_HINTS=1
+RECOMMEND_FIXES=0
 
 setup_colors() {
   if [[ -t 1 ]]; then
@@ -231,20 +232,22 @@ run_tcp() {
     *) add_finding "http_redirect" "camouflage" "HTTP→HTTPS redirect" "notice" "HTTP ${redir_code}" "Inconclusive camouflage signal." "camouflage" 1 ;;
   esac
 
-  local mis_out mis_cn
+  local mis_out mis_cn mis_tag
   mis_out=$(echo | timeout "$TIMEOUT" openssl s_client -connect "${host}:${port}" -servername "google.com" 2>/dev/null | openssl x509 -noout -subject 2>/dev/null) || mis_out=""
   mis_cn=$(echo "$mis_out" | sed 's/.*CN *= *//' | sed 's/[,\/].*//')
   if [[ -n "$mis_cn" ]]; then
-    add_finding "mismatched_sni" "exposure" "Foreign SNI behavior" "risk" "server returns cert for foreign SNI" "Responding cleanly to arbitrary SNI increases scan surface." "exposure" 0
+    if [[ -n "${cn:-}" && "$mis_cn" == "$cn" ]]; then mis_tag="same cert as main SNI"; else mis_tag="default/alternate cert"; fi
+    add_finding "mismatched_sni" "exposure" "Foreign SNI behavior" "risk" "CN=${mis_cn} (${mis_tag})" "Responding cleanly to arbitrary SNI increases scan surface." "exposure" 0
   else
     add_finding "mismatched_sni" "exposure" "Foreign SNI behavior" "ok" "connection closed or no cert" "Ignoring foreign SNI reduces generic probing surface." "exposure" 2
   fi
 
-  local nosni_out nosni_cn
+  local nosni_out nosni_cn nosni_tag
   nosni_out=$(echo | timeout "$TIMEOUT" openssl s_client -connect "${host}:${port}" -noservername 2>/dev/null | openssl x509 -noout -subject 2>/dev/null) || nosni_out=""
   nosni_cn=$(echo "$nosni_out" | sed 's/.*CN *= *//' | sed 's/[,\/].*//')
   if [[ -n "$nosni_cn" ]]; then
-    add_finding "no_sni" "exposure" "No-SNI behavior" "risk" "certificate returned without SNI" "Serving no-SNI clients makes the endpoint easier to classify." "exposure" 0
+    if [[ -n "${cn:-}" && "$nosni_cn" == "$cn" ]]; then nosni_tag="same cert as main SNI"; else nosni_tag="default/alternate cert"; fi
+    add_finding "no_sni" "exposure" "No-SNI behavior" "risk" "CN=${nosni_cn} (${nosni_tag})" "Serving no-SNI clients makes the endpoint easier to classify." "exposure" 0
   else
     add_finding "no_sni" "exposure" "No-SNI behavior" "ok" "connection closed or no cert" "Requiring SNI reduces generic scan surface." "exposure" 2
   fi
@@ -258,10 +261,9 @@ run_tcp() {
     *) add_finding "random_path" "camouflage" "Random path probe" "notice" "GET ${rand_path} → HTTP ${rand_status}" "Behavior is plausible but less typical." "camouflage" 1 ;;
   esac
 
-  local resp_headers srv_hdr hsts
-  resp_headers=$(curl -sk -I --max-time "$TIMEOUT" "https://${host}:${port}/" 2>/dev/null) || resp_headers=""
-  srv_hdr=$(echo "$resp_headers" | grep -i '^Server:' | head -1 | awk '{print $2}' | tr -d '\r')
-  hsts=$(echo "$resp_headers" | grep -ic '^Strict-Transport-Security:' || true)
+  local srv_hdr hsts
+  srv_hdr=$(echo "$root_headers" | grep -i '^Server:' | head -1 | awk '{print $2}' | tr -d '\r')
+  hsts=$(echo "$root_headers" | grep -ic '^Strict-Transport-Security:' || true)
   if [[ -n "$srv_hdr" && "$hsts" -gt 0 ]]; then
     add_finding "headers" "camouflage" "Response headers" "ok" "Server=${srv_hdr}, HSTS=yes" "Header profile looks more like an ordinary HTTPS deployment." "camouflage" 2
   elif [[ -n "$srv_hdr" ]]; then
@@ -384,7 +386,8 @@ build_payload_json() {
     "mode": $(json_escape "$mode"),
     "ip": $(json_escape "$ip"),
     "asn": $(json_escape "$asn"),
-    "sni": $(json_escape "$sni")
+    "sni": $(json_escape "$sni"),
+    "recommend_fixes": $RECOMMEND_FIXES
   },
   "confidence": {
     "score": $CONFIDENCE_SCORE,
@@ -475,7 +478,8 @@ main() {
       -t|--timeout) TIMEOUT="$2"; shift 2 ;;
       --json) OUTPUT_MODE="json"; shift ;;
       --debug-infer) DEBUG_INFER=1; shift ;;
-      --hardening-hints|--recommend-fixes) SHOW_HINTS=1; shift ;;
+      --hardening-hints) SHOW_HINTS=1; shift ;;
+      --recommend-fixes) SHOW_HINTS=1; RECOMMEND_FIXES=1; shift ;;
       --no-color) no_color; shift ;;
       -h|--help) usage; exit 0 ;;
       *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
