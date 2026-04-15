@@ -44,6 +44,14 @@ def _tls_surface_class(findings: dict[str, dict[str, Any]]) -> tuple[str, list[s
     return "default_cert_broad_front", ["foreign/no-SNI return a different/default/unknown certificate"]
 
 
+def _cert_routing_profile(tls_surface: str) -> str:
+    if tls_surface == "strict_sni_front":
+        return "strict_sni"
+    if tls_surface == "same_cert_broad_front":
+        return "same_cert_broad"
+    return "default_cert_broad"
+
+
 def _add(bucket: dict[str, dict[str, Any]], key: str, pts: float, support: str | None = None, against: str | None = None) -> None:
     bucket.setdefault(key, {"score": 0.0, "supports": [], "against": []})
     bucket[key]["score"] += pts
@@ -83,18 +91,17 @@ def _surface_risk(findings: dict[str, dict[str, Any]]) -> dict[str, Any]:
     if _sev(findings, "ws_leak") == "risk":
         score += 3
         reasons.append("WS transport endpoint exposed")
+    weak_grpc_count = 0
     if _sev(findings, "grpc_leak") == "risk":
         score += 3
         reasons.append("strong gRPC transport semantics exposed")
     elif _sev(findings, "grpc_leak") == "notice":
-        score += 1
-        reasons.append("weak gRPC hint")
+        weak_grpc_count += 1
     if _sev(findings, "grpc_strict_probe") == "risk":
         score += 4
         reasons.append("strict HTTP/2 gRPC semantics exposed")
     elif _sev(findings, "grpc_strict_probe") == "notice":
-        score += 1
-        reasons.append("partial strict gRPC hint")
+        weak_grpc_count += 1
     if _sev(findings, "http_connect") == "risk":
         score += 3
         reasons.append("CONNECT accepted like a proxy")
@@ -107,17 +114,22 @@ def _surface_risk(findings: dict[str, dict[str, Any]]) -> dict[str, Any]:
     if _sev(findings, "tls_profile") == "notice":
         score += 1
         reasons.append("older TLS profile")
-    if foreign_open and nosni_open and tls_surface != "strict_sni_front":
-        score += 1
-        reasons.append("combined foreign-SNI + no-SNI acceptance widens surface")
     suspicious_combo = (
-        _sev(findings, "grpc_leak") in {"risk", "notice"}
-        or _sev(findings, "grpc_strict_probe") in {"risk", "notice"}
-        or _sev(findings, "http_redirect") == "notice"
+        _sev(findings, "http_redirect") == "notice"
         or _sev(findings, "headers") == "notice"
         or _sev(findings, "ws_leak") == "risk"
         or _sev(findings, "http_connect") == "risk"
     )
+    if weak_grpc_count >= 2:
+        score += 2
+        reasons.append("repeated weak gRPC hints")
+    elif weak_grpc_count == 1 and suspicious_combo:
+        score += 1
+        reasons.append("weak gRPC hint combined with other anomalies")
+    if foreign_open and nosni_open and tls_surface != "strict_sni_front":
+        score += 1
+        reasons.append("combined foreign-SNI + no-SNI acceptance widens surface")
+    suspicious_combo = suspicious_combo or weak_grpc_count > 0 or _sev(findings, "grpc_leak") == "risk" or _sev(findings, "grpc_strict_probe") == "risk"
     if foreign_open and nosni_open and suspicious_combo and tls_surface != "strict_sni_front":
         score += 2
         reasons.append("broad SNI behavior appears alongside transport or web-profile anomalies")
@@ -188,6 +200,7 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
     grpc_hint = _sev(findings, "grpc_leak") == "notice"
     grpc_strict_exposed = _sev(findings, "grpc_strict_probe") == "risk"
     grpc_strict_hint = _sev(findings, "grpc_strict_probe") == "notice"
+    weak_grpc_hints = int(grpc_hint) + int(grpc_strict_hint)
     connect_accepted = _sev(findings, "http_connect") == "risk" and "accepted" in _obs(findings, "http_connect").lower()
     connect_rejected = _sev(findings, "http_connect") == "ok"
     foreign_open = _sev(findings, "foreign_sni", "mismatched_sni") == "risk"
@@ -242,11 +255,15 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if tls_surface == "same_cert_broad_front":
         _add(scores, "ordinary_web_front", -0.06, against="same-cert foreign/no-SNI broadness still widens scan surface")
     elif tls_surface == "default_cert_broad_front":
-        _add(scores, "ordinary_web_front", -0.16, against="different/default cert on foreign/no-SNI is more suspicious")
+        _add(scores, "ordinary_web_front", -0.22, against="different/default cert on foreign/no-SNI is a stronger anomaly")
     elif tls_surface == "strict_sni_front":
         _add(scores, "ordinary_web_front", 0.05, "strict SNI behavior is common for ordinary web fronting")
+    if foreign_open and _field(findings, "returned_relation", "foreign_sni", "mismatched_sni") == "different-cert":
+        _add(scores, "ordinary_web_front", -0.10, against="foreign SNI receives a different/default certificate")
+    if nosni_open and _field(findings, "returned_relation", "no_sni") == "different-cert":
+        _add(scores, "ordinary_web_front", -0.10, against="no-SNI receives a different/default certificate")
     if foreign_open and nosni_open and tls_surface == "default_cert_broad_front":
-        _add(scores, "ordinary_web_front", -0.08, against="combined broad-SNI behavior with alternate cert increases surface")
+        _add(scores, "ordinary_web_front", -0.12, against="combined broad-SNI behavior with alternate cert substantially increases surface")
     if ws_exposed:
         _add(scores, "ordinary_web_front", -0.18, against="WS transport appears exposed")
     if grpc_exposed:
@@ -325,6 +342,29 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
         if strong_negative >= 5:
             _add(scores, "tls_camouflage_relay", -0.06, against="multiple signs of an ordinary site")
 
+    # Default/shared certificate TLS front
+    if mode == "tcp" and web_ok and (foreign_open or nosni_open):
+        foreign_diff = foreign_open and _field(findings, "returned_relation", "foreign_sni", "mismatched_sni") == "different-cert"
+        nosni_diff = nosni_open and _field(findings, "returned_relation", "no_sni") == "different-cert"
+        if foreign_diff:
+            _add(scores, "default_cert_tls_front", 0.30, "foreign SNI is accepted with a different/default certificate")
+        if nosni_diff:
+            _add(scores, "default_cert_tls_front", 0.24, "no-SNI is accepted with a different/default certificate")
+        if tls_surface == "default_cert_broad_front":
+            _add(scores, "default_cert_tls_front", 0.18, "default-cert broad routing profile")
+        if _sev(findings, "headers") == "notice":
+            _add(scores, "default_cert_tls_front", 0.06, "weaker header profile")
+        if weak_grpc_hints >= 2:
+            _add(scores, "default_cert_tls_front", 0.06, "repeated weak gRPC hints")
+        elif weak_grpc_hints == 1 and (_sev(findings, "headers") == "notice" or _sev(findings, "http_redirect") == "notice"):
+            _add(scores, "default_cert_tls_front", 0.03, "weak gRPC hint appears with other anomalies")
+        if _sev(findings, "http_redirect") == "notice":
+            _add(scores, "default_cert_tls_front", 0.04, "HTTP redirect profile is weaker than expected")
+        if strong_web and headers_strong:
+            _add(scores, "default_cert_tls_front", -0.08, against="clean web profile lowers default-cert front suspicion")
+        if tls_surface == "same_cert_broad_front":
+            _add(scores, "default_cert_tls_front", -0.10, against="same-cert broadness is softer than default-cert routing")
+
     # Exposed V2Ray-style transport
     if ws_exposed:
         _add(scores, "exposed_v2ray_transport", 0.62, "WS upgrade succeeds on common paths")
@@ -398,6 +438,7 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     labels = {
         "ordinary_web_front": {"label": "Ordinary web front", "examples": ["nginx/apache/caddy style HTTPS site"]},
+        "default_cert_tls_front": {"label": "Default/shared-cert TLS front", "examples": ["default nginx vhost", "shared caddy cert front"]},
         "broad_tls_front": {"label": "Broad TLS front", "examples": ["wide-SNI TLS front", "generic HTTPS terminator"]},
         "tls_camouflage_relay": {"label": "TLS camouflage relay", "examples": ["Reality-like", "ShadowTLS-like", "Trojan-like"]},
         "exposed_v2ray_transport": {"label": "Exposed V2Ray-style transport", "examples": ["WS transport", "gRPC transport", "HTTP/2 transport"]},
@@ -432,7 +473,7 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if tls_surface == "default_cert_broad_front" and foreign_open and nosni_open:
         for h in hypotheses:
             if h["family"] == "ordinary_web_front":
-                h["score"] = round(max(0.0, h["score"] * 0.9), 3)
+                h["score"] = round(max(0.0, h["score"] * 0.85), 3)
                 if h["confidence"] == "high":
                     h["confidence"] = "medium"
                 h["against"] = (h.get("against", []) + ["broad SNI acceptance weakens 'ordinary front' confidence"])[:5]
@@ -469,7 +510,7 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "confidence": top["confidence"],
                 "caution": ordinary_caution,
             }
-        elif top["family"] == "broad_tls_front":
+        elif top["family"] in {"broad_tls_front", "default_cert_tls_front"}:
             broad_label = "Ordinary web front with broad TLS surface"
             broad_caution = "Broad SNI acceptance increases scan surface but is not, by itself, proof of relay usage."
             if tls_surface == "same_cert_broad_front":
@@ -511,6 +552,7 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "top_label": top["label"] if top else None,
         "overall_assessment": overall,
         "tls_surface_class": {"id": tls_surface, "reasons": tls_surface_reasons[:2]},
+        "cert_routing_profile": _cert_routing_profile(tls_surface),
         "surface_risk": _surface_risk(findings),
         "hardening_hints": _hardening_hints(payload, findings),
     }
@@ -544,6 +586,10 @@ def render_text(inference: dict[str, Any]) -> str:
     if tls_surface:
         lines.append("  TLS surface class:")
         lines.append(f"    {tls_surface.get('id')}")
+    cert_profile = inference.get("cert_routing_profile")
+    if cert_profile:
+        lines.append("  Cert routing profile:")
+        lines.append(f"    {cert_profile}")
     if surface:
         lines.append("  Surface risk:")
         lines.append(f"    {surface['label']} (score {surface['score']})")
@@ -578,6 +624,9 @@ def render_debug_text(payload: dict[str, Any], inference: dict[str, Any]) -> str
     tls_surface = inference.get("tls_surface_class")
     if tls_surface:
         lines.append(f"  TLS surface class: {tls_surface.get('id')}")
+    cert_profile = inference.get("cert_routing_profile")
+    if cert_profile:
+        lines.append(f"  Cert routing profile: {cert_profile}")
     if surface:
         lines.append(f"  Surface risk: {surface['label']} (score {surface['score']})")
     overall = inference.get("overall_assessment")
