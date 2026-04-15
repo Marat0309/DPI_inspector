@@ -59,10 +59,14 @@ classify_cert_relation() {
 }
 
 add_finding() {
-  local id="$1" category="$2" title="$3" severity="$4" observed="$5" impact="$6" axis="$7" score="$8"
+  local id="$1" category="$2" title="$3" severity="$4" observed="$5" impact="$6" axis="$7" score="$8" extra_json="${9:-}"
   [[ -n "$axis" && -n "$score" ]] && score_add "$axis" "$score"
   local obj
-  obj="{\"id\":$(json_escape "$id"),\"category\":$(json_escape "$category"),\"title\":$(json_escape "$title"),\"severity\":$(json_escape "$severity"),\"observed\":$(json_escape "$observed"),\"impact\":$(json_escape "$impact"),\"score_axis\":$(json_escape "$axis"),\"score_value\":$score}"
+  obj="{\"id\":$(json_escape "$id"),\"category\":$(json_escape "$category"),\"title\":$(json_escape "$title"),\"severity\":$(json_escape "$severity"),\"observed\":$(json_escape "$observed"),\"impact\":$(json_escape "$impact"),\"score_axis\":$(json_escape "$axis"),\"score_value\":$score"
+  if [[ -n "$extra_json" ]]; then
+    obj+=",${extra_json}"
+  fi
+  obj+="}"
   findings_json+=("$obj")
   if [[ "$OUTPUT_MODE" == "text" ]]; then
     local sym
@@ -250,20 +254,28 @@ run_tcp() {
   mis_out=$(echo | timeout "$TIMEOUT" openssl s_client -connect "${host}:${port}" -servername "google.com" 2>/dev/null | openssl x509 -noout -subject 2>/dev/null) || mis_out=""
   mis_cn=$(echo "$mis_out" | sed 's/.*CN *= *//' | sed 's/[,\/].*//')
   mis_relation=$(classify_cert_relation "$cn" "$mis_cn")
+  local mis_relation_json="$mis_relation"
+  [[ "$mis_relation_json" == "none" || -z "$mis_relation_json" ]] && mis_relation_json="unknown"
+  local mis_extra
+  mis_extra="\"returned_cn\":$(json_escape "$mis_cn"),\"returned_relation\":$(json_escape "$mis_relation_json"),\"main_cn\":$(json_escape "$cn")"
   if [[ -n "$mis_cn" ]]; then
-    add_finding "mismatched_sni" "exposure" "Foreign SNI behavior" "risk" "CN=${mis_cn} (${mis_relation})" "Responding cleanly to arbitrary SNI increases scan surface." "exposure" 0
+    add_finding "mismatched_sni" "exposure" "Foreign SNI behavior" "risk" "CN=${mis_cn} (${mis_relation})" "Responding cleanly to arbitrary SNI increases scan surface." "exposure" 0 "$mis_extra"
   else
-    add_finding "mismatched_sni" "exposure" "Foreign SNI behavior" "ok" "connection closed or no cert" "Ignoring foreign SNI reduces generic probing surface." "exposure" 2
+    add_finding "mismatched_sni" "exposure" "Foreign SNI behavior" "ok" "connection closed or no cert" "Ignoring foreign SNI reduces generic probing surface." "exposure" 2 "$mis_extra"
   fi
 
   local nosni_out nosni_cn nosni_relation
   nosni_out=$(echo | timeout "$TIMEOUT" openssl s_client -connect "${host}:${port}" -noservername 2>/dev/null | openssl x509 -noout -subject 2>/dev/null) || nosni_out=""
   nosni_cn=$(echo "$nosni_out" | sed 's/.*CN *= *//' | sed 's/[,\/].*//')
   nosni_relation=$(classify_cert_relation "$cn" "$nosni_cn")
+  local nosni_relation_json="$nosni_relation"
+  [[ "$nosni_relation_json" == "none" || -z "$nosni_relation_json" ]] && nosni_relation_json="unknown"
+  local nosni_extra
+  nosni_extra="\"returned_cn\":$(json_escape "$nosni_cn"),\"returned_relation\":$(json_escape "$nosni_relation_json"),\"main_cn\":$(json_escape "$cn")"
   if [[ -n "$nosni_cn" ]]; then
-    add_finding "no_sni" "exposure" "No-SNI behavior" "risk" "CN=${nosni_cn} (${nosni_relation})" "Serving no-SNI clients makes the endpoint easier to classify." "exposure" 0
+    add_finding "no_sni" "exposure" "No-SNI behavior" "risk" "CN=${nosni_cn} (${nosni_relation})" "Serving no-SNI clients makes the endpoint easier to classify." "exposure" 0 "$nosni_extra"
   else
-    add_finding "no_sni" "exposure" "No-SNI behavior" "ok" "connection closed or no cert" "Requiring SNI reduces generic scan surface." "exposure" 2
+    add_finding "no_sni" "exposure" "No-SNI behavior" "ok" "connection closed or no cert" "Requiring SNI reduces generic scan surface." "exposure" 2 "$nosni_extra"
   fi
 
   local rand_path rand_status
