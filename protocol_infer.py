@@ -53,6 +53,12 @@ def _surface_risk(findings: dict[str, dict[str, Any]]) -> dict[str, Any]:
     elif _sev(findings, "grpc_leak") == "notice":
         score += 1
         reasons.append("weak gRPC hint")
+    if _sev(findings, "grpc_strict_probe") == "risk":
+        score += 4
+        reasons.append("strict HTTP/2 gRPC semantics exposed")
+    elif _sev(findings, "grpc_strict_probe") == "notice":
+        score += 1
+        reasons.append("partial strict gRPC hint")
     if _sev(findings, "http_connect") == "risk":
         score += 3
         reasons.append("CONNECT accepted like a proxy")
@@ -107,9 +113,13 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
     random_path_risk = _sev(findings, "random_path") == "risk"
     headers_strong = _sev(findings, "headers") == "ok"
     headers_some = _sev(findings, "headers") in {"ok", "notice"}
+    alpn_ok = _sev(findings, "alpn_profile") == "ok"
+    alpn_weak = _sev(findings, "alpn_profile") == "notice"
     ws_exposed = _sev(findings, "ws_leak") == "risk"
     grpc_exposed = _sev(findings, "grpc_leak") == "risk"
     grpc_hint = _sev(findings, "grpc_leak") == "notice"
+    grpc_strict_exposed = _sev(findings, "grpc_strict_probe") == "risk"
+    grpc_strict_hint = _sev(findings, "grpc_strict_probe") == "notice"
     connect_accepted = _sev(findings, "http_connect") == "risk" and "accepted" in _obs(findings, "http_connect").lower()
     connect_rejected = _sev(findings, "http_connect") == "ok"
     foreign_open = _sev(findings, "foreign_sni", "mismatched_sni") == "risk"
@@ -122,7 +132,7 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
         strong_negative += 1
     if not ws_exposed:
         strong_negative += 1
-    if not grpc_exposed:
+    if not grpc_exposed and not grpc_strict_exposed:
         strong_negative += 1
     if strong_web:
         strong_negative += 1
@@ -146,13 +156,17 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
         _add(scores, "ordinary_web_front", 0.12, "strong normal header profile")
     elif headers_some:
         _add(scores, "ordinary_web_front", 0.06, "some normal header profile")
+    if alpn_ok:
+        _add(scores, "ordinary_web_front", 0.06, "ALPN profile looks web-like (h2+h1)")
+    elif alpn_weak:
+        _add(scores, "ordinary_web_front", 0.02, "partial ALPN web profile")
     if strong_web:
         _add(scores, "ordinary_web_front", 0.12, "plausible behavior on random paths")
     if connect_rejected:
         _add(scores, "ordinary_web_front", 0.10, "CONNECT rejected like a normal web server")
     if not ws_exposed:
         _add(scores, "ordinary_web_front", 0.07, "no obvious WS transport exposure")
-    if not grpc_exposed:
+    if not grpc_exposed and not grpc_strict_exposed:
         _add(scores, "ordinary_web_front", 0.07, "no obvious gRPC transport exposure")
     if strong_web and connect_rejected and not ws_exposed and not grpc_exposed and public_cert:
         _add(scores, "ordinary_web_front", 0.14, "combined normal-web behavior across path, CONNECT, and transport checks")
@@ -166,6 +180,8 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
         _add(scores, "ordinary_web_front", -0.18, against="WS transport appears exposed")
     if grpc_exposed:
         _add(scores, "ordinary_web_front", -0.22, against="gRPC transport appears exposed")
+    if grpc_strict_exposed:
+        _add(scores, "ordinary_web_front", -0.30, against="strict HTTP/2 gRPC semantics exposed")
     if connect_accepted:
         _add(scores, "ordinary_web_front", -0.22, against="CONNECT accepted like a proxy")
     if random_path_risk:
@@ -188,7 +204,7 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
             _add(scores, "broad_tls_front", 0.04, "certificate profile is less typical for mainstream web")
         if connect_rejected:
             _add(scores, "broad_tls_front", 0.03, "still behaves like a normal web server on CONNECT")
-        if not ws_exposed and not grpc_exposed:
+        if not ws_exposed and not grpc_exposed and not grpc_strict_exposed:
             _add(scores, "broad_tls_front", 0.03, "no obvious transport endpoints exposed")
         if strong_web and headers_strong:
             _add(scores, "broad_tls_front", -0.08, against="very normal web profile overall")
@@ -211,6 +227,7 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
             _add(scores, "tls_camouflage_relay", 0.10, "combined broad-SNI behavior")
         if cert_non_public:
             _add(scores, "tls_camouflage_relay", 0.08, "non-public or unusual certificate profile")
+        if not ws_exposed and not grpc_exposed and not grpc_strict_exposed:
         if not ws_exposed and not grpc_exposed:
             _add(scores, "tls_camouflage_relay", 0.05, "no exposed WS/gRPC transport paths")
         if strong_web:
@@ -229,6 +246,10 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
         _add(scores, "exposed_v2ray_transport", 0.58, "strong gRPC semantics surfaced")
     elif grpc_hint:
         _add(scores, "exposed_v2ray_transport", 0.14, "weak gRPC hint surfaced")
+    if grpc_strict_exposed:
+        _add(scores, "exposed_v2ray_transport", 0.46, "strict HTTP/2 gRPC semantics surfaced")
+    elif grpc_strict_hint:
+        _add(scores, "exposed_v2ray_transport", 0.16, "partial strict gRPC hint")
     if h2 and grpc_exposed:
         _add(scores, "exposed_v2ray_transport", 0.10, "HTTP/2 + gRPC combination")
     if connect_accepted:
@@ -272,7 +293,7 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
             _add(scores, "direct_http_proxy", 0.10, "HTTP/2 present alongside CONNECT")
 
     # Ordinary site with no clear tunnel evidence
-    if mode == "tcp" and strong_negative >= 5 and not connect_accepted and not ws_exposed and not grpc_exposed:
+    if mode == "tcp" and strong_negative >= 5 and not connect_accepted and not ws_exposed and not grpc_exposed and not grpc_strict_exposed:
         _add(scores, "no_clear_tunnel_evidence", 0.46, "normal web behavior with no exposed tunnel endpoints")
         if public_cert:
             _add(scores, "no_clear_tunnel_evidence", 0.12, "credible public certificate")
@@ -333,7 +354,8 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     overall = None
     if top:
-        if top["family"] in {"ordinary_web_front", "no_clear_tunnel_evidence"} and top["score"] >= 0.60 and not ws_exposed and not grpc_exposed and not connect_accepted and not (foreign_open and nosni_open):
+        if top["family"] in {"ordinary_web_front", "no_clear_tunnel_evidence"} and top["score"] >= 0.60 and not ws_exposed and not grpc_exposed and not grpc_strict_exposed and not connect_accepted and not (foreign_open and nosni_open):
+        if top["family"] in {"ordinary_web_front", "no_clear_tunnel_evidence"} and top["score"] >= 0.60 and not ws_exposed and not grpc_exposed and not grpc_strict_exposed and not connect_accepted and not (foreign_open and nosni_open):
             conf_label = top["confidence"]
             if foreign_open and nosni_open and conf_label == "high":
                 conf_label = "medium"

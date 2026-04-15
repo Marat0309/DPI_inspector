@@ -270,6 +270,17 @@ run_tcp() {
     add_finding "headers" "camouflage" "Response headers" "notice" "no useful Server header" "Header profile is sparse; camouflage signal is limited." "camouflage" 1
   fi
 
+  local h2_code h1_code
+  h2_code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 4 --http2 "https://${host}:${port}/" 2>/dev/null) || h2_code="000"
+  h1_code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 4 --http1.1 "https://${host}:${port}/" 2>/dev/null) || h1_code="000"
+  if [[ "$h2_code" =~ ^(200|301|302|307|403|404)$ && "$h1_code" =~ ^(200|301|302|307|403|404)$ ]]; then
+    add_finding "alpn_profile" "camouflage" "ALPN profile" "ok" "h2=${h2_code}, h1=${h1_code}" "Supports both H2 and H1.1 in a web-like way." "camouflage" 2
+  elif [[ "$h2_code" =~ ^(200|301|302|307|403|404)$ || "$h1_code" =~ ^(200|301|302|307|403|404)$ ]]; then
+    add_finding "alpn_profile" "camouflage" "ALPN profile" "notice" "h2=${h2_code}, h1=${h1_code}" "Only one HTTP ALPN path behaves web-like; profile is less typical." "camouflage" 1
+  else
+    add_finding "alpn_profile" "camouflage" "ALPN profile" "risk" "h2=${h2_code}, h1=${h1_code}" "Neither H2 nor H1.1 looked like a normal HTTPS front." "camouflage" 0
+  fi
+
   local ws_paths=("/" "/ws" "/websocket" "/ray" "/v2ray" "/vless" "/vmess" "/api" "/grpc" "/stream")
   local ws_leaked="" ws_key="dGhlIHNhbXBsZSBub25jZQ=="
   for ws_path in "${ws_paths[@]}"; do
@@ -305,6 +316,32 @@ run_tcp() {
   else
     add_finding "grpc_leak" "exposure" "gRPC leak" "ok" "no gRPC response on common paths" "No obvious gRPC transport endpoint exposure found." "exposure" 2
   fi
+
+  local grpc_strict_dump grpc_strict_code grpc_strict_ct grpc_strict_status grpc_strict_path="" grpc_strict_state="ok"
+  for p in "/grpc" "/ray" "/vless" "/vmess"; do
+    grpc_strict_dump=$(curl -sk --http2 -D - -o /dev/null --max-time 4 -X POST \
+      -H "Content-Type: application/grpc" -H "TE: trailers" -H "grpc-timeout: 1S" \
+      --data-binary $'\x00\x00\x00\x00\x00' "https://${host}:${port}${p}" 2>/dev/null) || grpc_strict_dump=""
+    grpc_strict_code=$(printf "%s" "$grpc_strict_dump" | head -1 | awk '{print $2}')
+    grpc_strict_ct=$(printf "%s" "$grpc_strict_dump" | grep -i '^content-type:' | grep -i 'application/grpc' | head -1) || grpc_strict_ct=""
+    grpc_strict_status=$(printf "%s" "$grpc_strict_dump" | grep -i '^grpc-status:' | head -1) || grpc_strict_status=""
+    if [[ "$grpc_strict_code" == "200" && -n "$grpc_strict_ct" && -n "$grpc_strict_status" ]]; then
+      grpc_strict_state="risk"; grpc_strict_path="$p"; break
+    elif [[ "$grpc_strict_code" == "200" && -n "$grpc_strict_ct" && "$grpc_strict_state" == "ok" ]]; then
+      grpc_strict_state="notice"; grpc_strict_path="$p"
+    fi
+  done
+  case "$grpc_strict_state" in
+    risk)
+      add_finding "grpc_strict_probe" "exposure" "gRPC strict probe" "risk" "HTTP/2 gRPC semantics on ${grpc_strict_path}" "Strict gRPC semantics under HTTP/2 strongly indicate an exposed transport endpoint." "exposure" 0
+      ;;
+    notice)
+      add_finding "grpc_strict_probe" "exposure" "gRPC strict probe" "notice" "gRPC content-type on ${grpc_strict_path}" "Partial gRPC semantics seen under HTTP/2; suspicious but not conclusive." "exposure" 1
+      ;;
+    *)
+      add_finding "grpc_strict_probe" "exposure" "gRPC strict probe" "ok" "no strict gRPC semantics found" "No strict HTTP/2 gRPC endpoint signature detected." "exposure" 2
+      ;;
+  esac
 
   local connect_code
   connect_code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 3 -X CONNECT "https://${host}:${port}/" 2>/dev/null) || connect_code="000"
