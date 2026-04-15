@@ -466,8 +466,7 @@ print_summary() {
 }
 
 usage() {
-  cat <<EOF
-
+  printf "%b" "
 ${BOLD}dpi_check.sh${NC} v${VERSION} — DPI Masquerade Inspector + protocol inference
 
 ${BOLD}USAGE${NC}
@@ -485,7 +484,7 @@ ${BOLD}OPTIONS${NC}
       --no-color             Plain output, no ANSI colors
   -h, --help                 Show this help
 
-EOF
+"
 }
 
 main() {
