@@ -1,0 +1,9 @@
+# default_cert_broad_front (trimmed)
+[01] Port scan              → 443/tcp open ssl/http
+[02] TLS certificate        → CN=service.example.org
+[06] Mismatched SNI         → default/other cert on unknown SNI
+[07] No SNI probe           → default fallback cert
+TLS surface class: default_cert_broad_front
+Cert routing profile: broad (default cert fallback)
+Surface risk: elevated
+Overall assessment: Front behavior looks less typical
