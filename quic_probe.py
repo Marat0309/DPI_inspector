@@ -17,6 +17,8 @@ import sys
 import time
 from datetime import datetime, timezone
 
+from protocol_infer import infer_payload, render_text
+
 try:
     from aioquic.asyncio import connect
     from aioquic.asyncio.protocol import QuicConnectionProtocol
@@ -371,6 +373,49 @@ def print_summary(c: Colors, sc: Score):
     print(f"  {c.DIM}{sc.pts}/{sc.max} pts — {label}{c.NC}\n")
 
 
+
+
+def _severity_from_verdict(verdict: str) -> str:
+    return {"pass": "ok", "warn": "notice", "fail": "risk", "info": "notice"}.get(verdict, "notice")
+
+
+def _add_finding(findings: list[dict], fid: str, title: str, verdict: str, observed: str, category: str = "exposure"):
+    findings.append({
+        "id": fid,
+        "category": category,
+        "title": title,
+        "severity": _severity_from_verdict(verdict),
+        "observed": observed,
+    })
+
+
+def _confidence_score(args, cert_ok: bool) -> int:
+    score = 100
+    if args.host_is_ip and not args.sni_explicit:
+        score -= 35
+    if args.host_is_ip and (args.sni or args.host).replace('.', '').isdigit():
+        score -= 15
+    if not cert_ok:
+        score -= 15
+    return max(score, 0)
+
+
+def _render_quic_assessment(findings: list[dict], host: str, port: int, sni: str, args) -> tuple[dict, str]:
+    cert_ok = any(f["id"] == "quic_cert" and f["severity"] in {"ok", "notice"} for f in findings)
+    payload = {
+        "target": {
+            "host": host,
+            "port": port,
+            "mode": "udp",
+            "sni": sni,
+            "recommend_fixes": False,
+        },
+        "confidence": {"score": _confidence_score(args, cert_ok), "label": "high", "reasons": ""},
+        "findings": findings,
+    }
+    inf = infer_payload(payload)
+    return inf, render_text(inf)
+
 # ── Main ──────────────────────────────────────────────────────
 async def main():
     ap = argparse.ArgumentParser(description="UDP/QUIC probe for DPI masquerade checks")
@@ -397,23 +442,62 @@ async def main():
     if not args.json:
         header(c, "UDP / QUIC CHECKS")
 
+    findings: list[dict] = []
     warm_client = await _connect(host, port, sni, timeout)
+
     await probe_udp_reachability(c, sc, host, port)
+    _add_finding(findings, "port_scan", "UDP port scan", "notice", f"{port}/udp checked")
+
+    pre_pts = sc.pts
     probe_raw_udp(c, sc, host, port)
+    raw_verdict = "pass" if sc.pts > pre_pts else "warn"
+    _add_finding(findings, "raw_udp", "Raw UDP", raw_verdict, "invalid QUIC probe")
+
+    pre_pts = sc.pts
     await probe_quic_handshake(c, sc, host, port, sni, timeout, warm_client)
+    hs_verdict = "pass" if (sc.pts - pre_pts) == 2 else "warn" if (sc.pts - pre_pts) == 1 else "fail"
+    hs_obs = "TLSv1.3 / h3" if hs_verdict != "fail" else "failed or timed out"
+    _add_finding(findings, "quic_handshake", "QUIC handshake", hs_verdict, hs_obs, category="reachability")
+
+    pre_pts = sc.pts
     await probe_certificate(c, sc, host, port, sni, timeout, warm_client)
+    cert_delta = sc.pts - pre_pts
+    cert_verdict = "pass" if cert_delta == 2 else "warn" if cert_delta == 1 else "fail"
+    _add_finding(findings, "quic_cert", "QUIC certificate", cert_verdict, "certificate over QUIC")
+
+    pre_pts = sc.pts
     await probe_mismatched_sni(c, sc, host, port, timeout)
+    mis_delta = sc.pts - pre_pts
+    mis_verdict = "pass" if mis_delta == 2 else "fail" if mis_delta == 1 else "warn"
+    _add_finding(findings, "mismatched_sni", "Foreign SNI behavior", mis_verdict, "QUIC foreign-SNI probe")
+
+    pre_pts = sc.pts
     await probe_no_sni(c, sc, host, port, timeout)
+    nosni_delta = sc.pts - pre_pts
+    nosni_verdict = "pass" if nosni_delta == 2 else "fail" if nosni_delta == 1 else "warn"
+    _add_finding(findings, "no_sni", "No-SNI behavior", nosni_verdict, "QUIC no-SNI probe")
+
+    pre_pts = sc.pts
     await probe_http3(c, sc, host, port, sni, timeout)
+    h3_delta = sc.pts - pre_pts
+    h3_verdict = "pass" if h3_delta == 2 else "warn"
+    _add_finding(findings, "http3", "HTTP/3 fallback", h3_verdict, "HTTP/3 probe")
+
     await probe_port_hopping(c, sc, host, timeout)
+
+    inference, inference_txt = _render_quic_assessment(findings, host, port, sni, args)
 
     if args.json:
         print(json.dumps({
             "target": {"host": host, "port": port, "sni": sni, "mode": "udp"},
             "score": {"pts": sc.pts, "max": sc.max, "pct": sc.pct()},
+            "findings": findings,
+            "protocol_inference": inference,
         }, ensure_ascii=False))
     else:
         print_summary(c, sc)
+        if inference_txt:
+            print(inference_txt)
 
 
 if __name__ == "__main__":
