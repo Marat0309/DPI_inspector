@@ -13,6 +13,7 @@ SNI_EXPLICIT=0
 DEBUG_INFER=0
 SHOW_HINTS=1
 RECOMMEND_FIXES=0
+NO_ASN=0
 
 setup_colors() {
   if [[ -t 1 ]]; then
@@ -101,6 +102,30 @@ is_ipv4() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
 is_ipv6() { [[ "$1" == *:* ]]; }
 is_ip_literal() { is_ipv4 "$1" || is_ipv6 "$1"; }
 
+# Validate host: allows domain names, IPv4, and bracket-wrapped IPv6
+validate_host() {
+  local h="$1"
+  if [[ -z "$h" ]]; then
+    echo "Error: host must not be empty." >&2; exit 1
+  fi
+  # IPv6 in brackets [::1]
+  if [[ "$h" =~ ^\[.*\]$ ]]; then return; fi
+  # IPv4 or domain label characters only
+  if [[ ! "$h" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
+    echo "Error: invalid host '$h' (unexpected characters)." >&2; exit 1
+  fi
+}
+
+# Validate SNI: must be a plain domain name (no brackets, no bare IPs accepted
+# as SNI since they are rejected by most TLS stacks anyway)
+validate_sni() {
+  local s="$1"
+  [[ -z "$s" ]] && return
+  if [[ ! "$s" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
+    echo "Error: invalid SNI '$s' (must contain only [a-zA-Z0-9._-])." >&2; exit 1
+  fi
+}
+
 print_banner() {
   local host="$1" port="$2" mode="$3" ip="$4" asn="$5" sni="$6"
   [[ "$OUTPUT_MODE" != "text" ]] && return
@@ -139,6 +164,7 @@ parse_vpn_url() {
 
 get_asn() {
   local ip="$1"
+  if [[ $NO_ASN -eq 1 ]]; then echo "(lookup disabled)"; return; fi
   local asn=""
   asn=$(curl -s --max-time 3 "https://ipinfo.io/${ip}/org" 2>/dev/null) || true
   [[ -z "$asn" || "$asn" == *"Whoa"* ]] && asn=$(whois "$ip" 2>/dev/null | grep -iE "^(OrgName|org-name|netname|origin):" | head -1 | sed 's/.*:\s*//' | xargs 2>/dev/null) || true
@@ -207,15 +233,51 @@ run_tcp() {
   cipher=$(echo "$tls_raw" | grep "Cipher is" | sed 's/.*Cipher is //' | tr -d ' \r')
   alpn=$(echo "$tls_raw" | grep "ALPN protocol" | sed 's/.*ALPN protocol: //' | tr -d ' \r')
 
+  # Extract full cert text for SAN and key-algorithm analysis (reuse tls_raw, no extra roundtrip)
+  local cert_text san_raw key_alg
+  cert_text=$(echo "$tls_raw" | openssl x509 -noout -text 2>/dev/null) || cert_text=""
+  san_raw=$(echo "$cert_text" | grep -A2 "Subject Alternative Name" | grep "DNS:" \
+            | tr ',' '\n' | grep "DNS:" | sed 's/.*DNS:\s*//' | tr -d ' \r') || san_raw=""
+  key_alg=$(echo "$cert_text" | grep "Public Key Algorithm:" \
+            | sed 's/.*Public Key Algorithm:\s*//' | tr -d ' \r' | head -1) || key_alg=""
+
   if [[ -n "$cn" ]]; then
-    local cert_detail="CN=${cn}, issuer=${issuer_o:-?}, ${days_left}d left"
-    if echo "$issuer_o" | grep -qiE "let.s encrypt|digicert|sectigo|globalsign|comodo|zerossl|google"; then
+    local cert_detail="CN=${cn}, issuer=${issuer_o:-?}, ${days_left}d${key_alg:+, $key_alg}"
+    if echo "$issuer_o" | grep -qiE "let.s encrypt|digicert|sectigo|globalsign|comodo|zerossl|google|entrust|trustwave|godaddy|buypass"; then
       add_finding "tls_cert" "camouflage" "TLS certificate" "ok" "$cert_detail" "Public CA certificate usually blends better with ordinary HTTPS services." "camouflage" 2
     else
       add_finding "tls_cert" "camouflage" "TLS certificate" "notice" "$cert_detail" "Certificate works, but trust/profile may look less typical." "camouflage" 1
     fi
   else
     add_finding "tls_cert" "camouflage" "TLS certificate" "risk" "no certificate returned" "Could not validate the TLS presentation." "camouflage" 0
+  fi
+
+  # SAN match: check whether the certificate explicitly covers the probed SNI.
+  # Only meaningful for domain-name targets (not bare IPs).
+  if ! is_ip_literal "$sni" && [[ -n "$cn" ]]; then
+    local san_match=0
+    # Direct match in SAN list
+    if echo "$san_raw" | grep -qiF "$sni"; then
+      san_match=1
+    else
+      # Wildcard match: *.example.com covers sub.example.com (one level only)
+      local sni_parent="${sni#*.}"
+      if [[ "$sni" != "$sni_parent" ]] && echo "$san_raw" | grep -qiF "*.$sni_parent"; then
+        san_match=1
+      fi
+    fi
+    # Fallback: old-style cert with CN only and no SANs
+    if [[ $san_match -eq 0 && -z "$san_raw" ]]; then
+      local cn_lower="${cn,,}" sni_lower="${sni,,}"
+      if [[ "$cn_lower" == "$sni_lower" || "$cn_lower" == "*.${sni_lower#*.}" ]]; then
+        san_match=1
+      fi
+    fi
+    if [[ $san_match -eq 1 ]]; then
+      add_finding "cert_san" "camouflage" "Cert SAN match" "ok" "SNI=${sni} covered by cert" "Certificate explicitly covers the target SNI — expected for a genuine web deployment." "camouflage" 2
+    else
+      add_finding "cert_san" "camouflage" "Cert SAN match" "notice" "SNI=${sni} not in cert (CN=${cn})" "Certificate does not cover the probed SNI — may indicate a shared, default, or fronted cert." "camouflage" 0
+    fi
   fi
 
   local hs_detail="${tls_ver:-?} / ${cipher:0:20}${alpn:+ / $alpn}"
@@ -229,17 +291,39 @@ run_tcp() {
     add_finding "tls_handshake" "reachability" "TLS handshake" "risk" "failed or unknown TLS version" "TLS endpoint did not complete a usable handshake." "reachability" 0
   fi
 
-  local root_meta root_status root_ct root_elapsed root_headers
-  root_meta=$(curl -sk -D - -o /dev/null -w '\n__TIME__:%{time_total}\n__CTYPE__:%{content_type}\n' --max-time "$TIMEOUT" "https://${host}:${port}/" 2>/dev/null) || root_meta=""
+  local root_meta root_status root_ct root_elapsed root_headers root_size
+  root_meta=$(curl -sk -D - -w '\n__TIME__:%{time_total}\n__CTYPE__:%{content_type}\n__SIZE__:%{size_download}\n' \
+              --max-time "$TIMEOUT" "https://${host}:${port}/" -o /dev/null 2>/dev/null) || root_meta=""
   root_headers=$(printf "%s" "$root_meta" | sed '/^__TIME__:/,$d')
   root_status=$(printf "%s" "$root_headers" | head -1 | awk '{print $2}')
   root_elapsed=$(printf "%s" "$root_meta" | sed -n 's/^__TIME__://p' | head -1)
   root_ct=$(printf "%s" "$root_meta" | sed -n 's/^__CTYPE__://p' | head -1 | cut -d';' -f1)
+  root_size=$(printf "%s" "$root_meta" | sed -n 's/^__SIZE__://p' | head -1)
 
   case "$root_status" in
-    200) add_finding "http_fallback" "camouflage" "HTTP fallback" "ok" "HTTP ${root_status} ${root_ct} (${root_elapsed}s)" "Looks like an ordinary HTTPS front page." "camouflage" 2 ;;
-    301|302|307|403|404) add_finding "http_fallback" "camouflage" "HTTP fallback" "notice" "HTTP ${root_status} ${root_ct} (${root_elapsed}s)" "Usable web behavior, though less convincing than a normal 200 page." "camouflage" 1 ;;
-    *) add_finding "http_fallback" "camouflage" "HTTP fallback" "risk" "HTTP ${root_status:-000}" "No credible HTTPS fallback page detected." "camouflage" 0 ;;
+    200)
+      # Very small body on a 200 is suspicious — proxy stubs often return empty or
+      # near-empty bodies, while real web pages are typically hundreds of bytes or more.
+      if [[ -n "$root_size" && "$root_size" -lt 512 ]]; then
+        add_finding "http_fallback" "camouflage" "HTTP fallback" "notice" \
+          "HTTP 200 body=${root_size}B ${root_ct} (${root_elapsed}s)" \
+          "200 with very small body (${root_size}B) may indicate a minimal proxy stub rather than a real page." "camouflage" 1
+      else
+        add_finding "http_fallback" "camouflage" "HTTP fallback" "ok" \
+          "HTTP 200 ${root_ct} ${root_size:+${root_size}B }(${root_elapsed}s)" \
+          "Looks like an ordinary HTTPS front page." "camouflage" 2
+      fi
+      ;;
+    301|302|307|403|404)
+      add_finding "http_fallback" "camouflage" "HTTP fallback" "notice" \
+        "HTTP ${root_status} ${root_ct} (${root_elapsed}s)" \
+        "Usable web behavior, though less convincing than a normal 200 page." "camouflage" 1
+      ;;
+    *)
+      add_finding "http_fallback" "camouflage" "HTTP fallback" "risk" \
+        "HTTP ${root_status:-000}" \
+        "No credible HTTPS fallback page detected." "camouflage" 0
+      ;;
   esac
 
   local redirect_meta redir_code redir_url
@@ -252,8 +336,10 @@ run_tcp() {
     *) add_finding "http_redirect" "camouflage" "HTTP→HTTPS redirect" "notice" "HTTP ${redir_code}" "Inconclusive camouflage signal." "camouflage" 1 ;;
   esac
 
+  # Foreign SNI probe uses test.invalid (RFC 2606 reserved — never legitimately hosted,
+  # not subject to GeoIP/political filters that affect real domains like google.com).
   local mis_out mis_cn mis_relation
-  mis_out=$(echo | timeout "$TIMEOUT" openssl s_client -connect "${host}:${port}" -servername "google.com" 2>/dev/null | openssl x509 -noout -subject 2>/dev/null) || mis_out=""
+  mis_out=$(echo | timeout "$TIMEOUT" openssl s_client -connect "${host}:${port}" -servername "test.invalid" 2>/dev/null | openssl x509 -noout -subject 2>/dev/null) || mis_out=""
   mis_cn=$(echo "$mis_out" | sed 's/.*CN *= *//' | sed 's/[,\/].*//')
   mis_relation=$(classify_cert_relation "$cn" "$mis_cn")
   local mis_relation_json="$mis_relation"
@@ -301,18 +387,39 @@ run_tcp() {
     add_finding "headers" "camouflage" "Response headers" "notice" "no useful Server header" "Header profile is sparse; camouflage signal is limited." "camouflage" 1
   fi
 
+  # ALPN probe: use the *negotiated* ALPN from the TLS handshake (already in $alpn)
+  # as the primary signal. curl --http2 / --http1.1 are used only to verify that
+  # HTTP actually works over each version, not to infer what was negotiated.
   local h2_code h1_code
   h2_code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 4 --http2 "https://${host}:${port}/" 2>/dev/null) || h2_code="000"
   h1_code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 4 --http1.1 "https://${host}:${port}/" 2>/dev/null) || h1_code="000"
-  if [[ "$h2_code" =~ ^(200|301|302|307|403|404)$ && "$h1_code" =~ ^(200|301|302|307|403|404)$ ]]; then
-    add_finding "alpn_profile" "camouflage" "ALPN profile" "ok" "h2=${h2_code}, h1=${h1_code}" "Supports both H2 and H1.1 in a web-like way." "camouflage" 2
-  elif [[ "$h2_code" =~ ^(200|301|302|307|403|404)$ || "$h1_code" =~ ^(200|301|302|307|403|404)$ ]]; then
-    add_finding "alpn_profile" "camouflage" "ALPN profile" "notice" "h2=${h2_code}, h1=${h1_code}" "Only one HTTP ALPN path behaves web-like; profile is less typical." "camouflage" 1
+  local h2_ok=0 h1_ok=0
+  [[ "$h2_code" =~ ^(200|301|302|307|403|404)$ ]] && h2_ok=1
+  [[ "$h1_code" =~ ^(200|301|302|307|403|404)$ ]] && h1_ok=1
+  local alpn_detail="negotiated=${alpn:-none}, h2=${h2_code}, h1=${h1_code}"
+  if [[ "$alpn" == "h2" && $h2_ok -eq 1 && $h1_ok -eq 1 ]]; then
+    add_finding "alpn_profile" "camouflage" "ALPN profile" "ok" "$alpn_detail" "Server negotiated h2 and accepts both H2 and H1.1 — typical web-like profile." "camouflage" 2
+  elif [[ "$alpn" == "h2" && $h2_ok -eq 1 ]]; then
+    add_finding "alpn_profile" "camouflage" "ALPN profile" "notice" "$alpn_detail" "Server negotiated h2 but H1.1 path is not responsive; single-ALPN profile." "camouflage" 1
+  elif [[ "$alpn" == "h2" ]]; then
+    add_finding "alpn_profile" "camouflage" "ALPN profile" "notice" "$alpn_detail" "Server negotiated h2 in TLS but HTTP itself did not respond normally." "camouflage" 1
+  elif [[ "$alpn" == "http/1.1" ]]; then
+    add_finding "alpn_profile" "camouflage" "ALPN profile" "notice" "$alpn_detail" "Server only negotiated HTTP/1.1; no h2 support detected in TLS handshake." "camouflage" 1
+  elif [[ -z "$alpn" && $h2_ok -eq 1 && $h1_ok -eq 1 ]]; then
+    # ALPN not advertised in TLS but both HTTP versions respond — infer from behavior
+    add_finding "alpn_profile" "camouflage" "ALPN profile" "ok" "$alpn_detail" "Both H2 and H1.1 respond normally; ALPN not captured from TLS handshake." "camouflage" 2
+  elif [[ $h2_ok -eq 1 || $h1_ok -eq 1 ]]; then
+    add_finding "alpn_profile" "camouflage" "ALPN profile" "notice" "$alpn_detail" "Only one HTTP version responds normally." "camouflage" 1
   else
-    add_finding "alpn_profile" "camouflage" "ALPN profile" "risk" "h2=${h2_code}, h1=${h1_code}" "Neither H2 nor H1.1 looked like a normal HTTPS front." "camouflage" 0
+    add_finding "alpn_profile" "camouflage" "ALPN profile" "risk" "$alpn_detail" "Neither H2 nor H1.1 returned a normal HTTP response." "camouflage" 0
   fi
 
-  local ws_paths=("/" "/ws" "/websocket" "/ray" "/v2ray" "/vless" "/vmess" "/api" "/grpc" "/stream")
+  # WS paths: standard + common proxy configs + generic transport-sounding paths.
+  # Non-standard paths (/proxy, /tunnel, /pipe, etc.) cover custom V2Ray/Xray configs.
+  local ws_paths=("/" "/ws" "/wss" "/websocket" "/socket" "/sock"
+                  "/ray" "/v2ray" "/xray" "/vless" "/vmess" "/trojan"
+                  "/api" "/grpc" "/stream" "/proxy" "/tunnel"
+                  "/connect" "/live" "/pipe" "/net" "/data")
   local ws_leaked="" ws_key="dGhlIHNhbXBsZSBub25jZQ=="
   for ws_path in "${ws_paths[@]}"; do
     local ws_code
@@ -325,7 +432,9 @@ run_tcp() {
     add_finding "ws_leak" "exposure" "WebSocket leak" "ok" "no WS upgrade on common paths" "No obvious WS transport endpoint exposure found." "exposure" 2
   fi
 
-  local grpc_paths=("/" "/grpc" "/ray" "/vless" "/vmess" "/tun" "/api")
+  # gRPC paths: standard + common proxy configs + generic service-sounding paths.
+  local grpc_paths=("/" "/grpc" "/ray" "/xray" "/vless" "/vmess" "/trojan"
+                    "/tun" "/api" "/proxy" "/stream" "/service" "/net" "/data")
   local grpc_strong="" grpc_hint=""
   for grpc_path in "${grpc_paths[@]}"; do
     local grpc_dump grpc_code grpc_ct grpc_status grpc_msg
@@ -349,7 +458,7 @@ run_tcp() {
   fi
 
   local grpc_strict_dump grpc_strict_code grpc_strict_ct grpc_strict_status grpc_strict_path="" grpc_strict_state="ok"
-  for p in "/grpc" "/ray" "/vless" "/vmess"; do
+  for p in "/grpc" "/ray" "/xray" "/vless" "/vmess" "/trojan" "/proxy" "/stream" "/service"; do
     grpc_strict_dump=$(curl -sk --http2 -D - -o /dev/null --max-time 4 -X POST \
       -H "Content-Type: application/grpc" -H "TE: trailers" -H "grpc-timeout: 1S" \
       --data-binary $'\x00\x00\x00\x00\x00' "https://${host}:${port}${p}" 2>/dev/null) || grpc_strict_dump=""
@@ -381,6 +490,48 @@ run_tcp() {
     400|405|501) add_finding "http_connect" "exposure" "HTTP CONNECT" "ok" "CONNECT rejected (${connect_code})" "Rejecting CONNECT matches ordinary web server behavior." "exposure" 2 ;;
     *) add_finding "http_connect" "exposure" "HTTP CONNECT" "notice" "CONNECT returned ${connect_code}" "Behavior is not clearly proxy-like, but not strongly normal either." "exposure" 1 ;;
   esac
+
+  probe_h2_settings "$host" "$port" "$sni"
+}
+
+# Optional HTTP/2 SETTINGS fingerprint via nghttp (from package nghttp2-client).
+# Known MAX_CONCURRENT_STREAMS baselines: nginx=128, Apache=100, Caddy=250.
+# Proxy/relay implementations (Xray, V2Ray) often use 1000 or unlimited (0).
+# Skipped silently when nghttp is not installed.
+probe_h2_settings() {
+  local host="$1" port="$2" sni="$3"
+  command -v nghttp >/dev/null 2>&1 || return
+
+  local h2_raw
+  h2_raw=$(timeout 5 nghttp -nv --no-verify-peer "https://${host}:${port}/" 2>&1) || h2_raw=""
+  [[ -z "$h2_raw" ]] && return
+
+  # Parse SETTINGS values from nghttp verbose output
+  local max_streams initial_window enable_push
+  max_streams=$(echo "$h2_raw" \
+    | grep -oE "SETTINGS_MAX_CONCURRENT_STREAMS\([^)]*\):[0-9]+" \
+    | grep -oE "[0-9]+$" | head -1) || max_streams=""
+  initial_window=$(echo "$h2_raw" \
+    | grep -oE "SETTINGS_INITIAL_WINDOW_SIZE\([^)]*\):[0-9]+" \
+    | grep -oE "[0-9]+$" | head -1) || initial_window=""
+  enable_push=$(echo "$h2_raw" \
+    | grep -oE "SETTINGS_ENABLE_PUSH\([^)]*\):[0-9]+" \
+    | grep -oE "[0-9]+$" | head -1) || enable_push=""
+
+  [[ -z "$max_streams$initial_window$enable_push" ]] && return
+
+  local detail="MAX_STREAMS=${max_streams:-?} WIN=${initial_window:-?} PUSH=${enable_push:-?}"
+  local verdict="ok"
+  local impact="HTTP/2 settings match a typical web-server profile."
+
+  # Very high or unlimited MAX_CONCURRENT_STREAMS is outside standard web-server range
+  if [[ -n "$max_streams" ]] && { (( max_streams > 500 )) || (( max_streams == 0 )); }; then
+    verdict="notice"
+    impact="MAX_CONCURRENT_STREAMS=${max_streams} is outside the normal range for nginx/Apache/Caddy — more typical of relay/proxy implementations."
+  fi
+
+  local score_val=2; [[ "$verdict" == "notice" ]] && score_val=1
+  add_finding "h2_settings" "camouflage" "HTTP/2 settings" "$verdict" "$detail" "$impact" "camouflage" "$score_val"
 }
 
 run_udp() {
@@ -481,6 +632,7 @@ ${BOLD}OPTIONS${NC}
       --hardening-hints      Show hardening hints in the text output (default on)
       --recommend-fixes      Alias for --hardening-hints
       --lang=ru|en           Output language for interpretation layer (default: en)
+      --no-asn               Skip external ASN lookup (ipinfo.io) for privacy
       --no-color             Plain output, no ANSI colors
   -h, --help                 Show this help
 
@@ -517,13 +669,22 @@ main() {
       --recommend-fixes) SHOW_HINTS=1; RECOMMEND_FIXES=1; shift ;;
       --lang=ru) LANG_MODE="ru"; shift ;;
       --lang=en) LANG_MODE="en"; shift ;;
+      --no-asn) NO_ASN=1; shift ;;
       --no-color) no_color; shift ;;
       -h|--help) usage; exit 0 ;;
       *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
     esac
   done
 
+  # Validate port range
+  if [[ ! "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+    echo "Error: invalid port '$port' (must be 1–65535)." >&2; exit 1
+  fi
+
+  validate_host "$host"
+
   [[ -z "$sni" ]] && sni="$host"
+  validate_sni "$sni"
 
   local ip=""
   ip=$(dig +short "$host" 2>/dev/null | grep -E '^[0-9]' | head -1) || true
@@ -533,7 +694,15 @@ main() {
   asn=$(get_asn "$ip") || asn="unknown"
 
   if [[ "$mode" == "auto" ]]; then
-    if timeout 2 bash -c "echo >/dev/tcp/${host}/${port}" 2>/dev/null; then mode="tcp"; else mode="udp"; fi
+    if timeout 2 bash -c "echo >/dev/tcp/${host}/${port}" 2>/dev/null; then
+      mode="tcp"
+    else
+      # TCP is unreachable; assume UDP/QUIC.
+      # Note: UDP open/filtered states are indistinguishable without an actual
+      # QUIC handshake — quic_probe.py will perform that check and report
+      # if the port turns out to be unresponsive.
+      mode="udp"
+    fi
   fi
 
   if [[ "$mode" == "udp" ]]; then

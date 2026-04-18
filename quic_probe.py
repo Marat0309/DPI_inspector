@@ -6,10 +6,12 @@ Part of dpi_check — https://github.com/...
 Usage: quic_probe.py <host> <port> [sni] [--no-color]
 Requires: pip install aioquic
 """
+from __future__ import annotations
 
 import asyncio
 import argparse
 import json
+import logging
 import socket
 import ssl
 import subprocess
@@ -130,8 +132,8 @@ class ProbeProtocol(QuicConnectionProtocol):
                 'issuer':   issuer_o[0].value if issuer_o else '?',
                 'not_after': cert.not_valid_after_utc,
             }
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug("Certificate extraction failed: %s", e)
 
 
 async def _connect(host: str, port: int, sni: str | None, timeout: int) -> ProbeProtocol | None:
@@ -253,9 +255,14 @@ async def probe_certificate(c: Colors, sc: Score, host: str, port: int,
 
 
 async def probe_mismatched_sni(c: Colors, sc: Score, host: str, port: int, timeout: int):
-    """QUIC handshake with foreign SNI (google.com)"""
+    """QUIC handshake with a guaranteed-invalid foreign SNI (test.invalid).
+
+    RFC 2606 reserves .invalid so it can never be legitimately hosted, and it
+    is not subject to GeoIP / political SNI filters that affect popular domains
+    like google.com — making it a more neutral probe target.
+    """
     num = 5
-    client = await _connect(host, port, "google.com", timeout)
+    client = await _connect(host, port, "test.invalid", timeout)
     if client is None:
         print_row(c, sc, num, "Mismatched SNI", "timeout — server ignores foreign SNI", "pass")
     elif client is False:
@@ -326,8 +333,8 @@ async def probe_http3(c: Colors, sc: Score, host: str, port: int,
                     break
     except asyncio.TimeoutError:
         pass
-    except Exception:
-        pass
+    except Exception as e:
+        logging.debug("HTTP/3 probe failed: %s", e)
 
     if status:
         print_row(c, sc, num, "HTTP/3 fallback", f"HTTP/3 {status}", "pass")
@@ -350,8 +357,8 @@ async def probe_port_hopping(c: Colors, sc: Score, host: str, timeout: int):
             open_count += 1
         except socket.timeout:
             open_count += 1   # silence = open|filtered (normal)
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug("Port hop check failed on %d: %s", p, e)
         finally:
             sock.close()
     detail = f"spot-check ports {test_ports[0]},{test_ports[-1]} (UDP)"
@@ -468,12 +475,18 @@ async def main():
     pre_pts = sc.pts
     await probe_mismatched_sni(c, sc, host, port, timeout)
     mis_delta = sc.pts - pre_pts
+    # NOTE: delta==1 (warn) maps to FAIL here — intentional inversion.
+    # For SNI probes, a partial success (server answered but reset) means the
+    # server *accepted* the foreign SNI at the TLS layer — a risk signal.
+    # Complete silence (timeout/delta==0) is actually the safest outcome (→ warn).
     mis_verdict = "pass" if mis_delta == 2 else "fail" if mis_delta == 1 else "warn"
     _add_finding(findings, "mismatched_sni", "Foreign SNI behavior", mis_verdict, "QUIC foreign-SNI probe")
 
     pre_pts = sc.pts
     await probe_no_sni(c, sc, host, port, timeout)
     nosni_delta = sc.pts - pre_pts
+    # Same intentional inversion as mis_verdict above: partial SNI acceptance is
+    # riskier than no response (the latter means strict SNI enforcement is active).
     nosni_verdict = "pass" if nosni_delta == 2 else "fail" if nosni_delta == 1 else "warn"
     _add_finding(findings, "no_sni", "No-SNI behavior", nosni_verdict, "QUIC no-SNI probe")
 
