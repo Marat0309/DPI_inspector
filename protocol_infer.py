@@ -43,6 +43,14 @@ _W: dict[str, dict[str, float]] = {
         # h2_settings signals (optional — only present if nghttp is installed)
         "h2_settings_normal": 0.04,   # Standard web-server H2 settings profile
         "h2_settings_unusual":-0.06,  # Unusual MAX_CONCURRENT_STREAMS etc.
+        # new supplementary signals (each individually weak, collectively meaningful)
+        "ocsp_stapled":       0.04,   # OCSP stapling configured
+        "web_presence":       0.06,   # robots.txt or favicon.ico returned 200
+        "alt_svc_h3":         0.04,   # HTTP/3 advertised via Alt-Svc
+        "rdns_match":         0.04,   # PTR record matches the target domain
+        "options_normal":     0.02,   # OPTIONS → 405/501 or 200+Allow
+        "options_proxy":     -0.04,   # OPTIONS → 200 without Allow (proxy-like)
+        "asn_cdn":            0.04,   # CDN/major-cloud network ASN
     },
     "broad_tls_front": {
         "public_cert":        0.12,
@@ -56,6 +64,7 @@ _W: dict[str, dict[str, float]] = {
         "no_transport":       0.03,
         "very_normal_web":   -0.08,
         "no_indicators":     -0.08,
+        "asn_vps":            0.04,   # VPS/hosting ASN is a mild supporting signal
     },
     "cdn_or_reverse_proxy_front": {
         "edge_like":          0.24,
@@ -64,6 +73,8 @@ _W: dict[str, dict[str, float]] = {
         "headers_some":       0.08,
         "redirect_ok":        0.06,
         "transport_exposed": -0.12,
+        "asn_cdn":            0.16,   # CDN/major-cloud ASN is strong supporting evidence
+        "alt_svc_h3":         0.12,   # HTTP/3 Alt-Svc advertisement is CDN-typical
     },
     "tls_camouflage_relay": {
         "public_cert":        0.10,
@@ -80,6 +91,8 @@ _W: dict[str, dict[str, float]] = {
         "cert_san_match":    -0.06,   # SNI-covered cert matches legitimate deployment, not camouflage
         "cert_san_mismatch":  0.08,   # SNI mismatch is a mild signal toward shared/default cert behaviour
         "h2_settings_unusual":0.04,   # Unusual H2 settings are a mild proxy signal
+        "asn_vps":            0.04,   # VPS/hosting ASN slightly supports a relay deployment
+        "web_presence":      -0.04,   # Real web assets speak against a pure camouflage relay
     },
     "default_cert_tls_front": {
         "foreign_diff":       0.30,
@@ -134,6 +147,10 @@ _W: dict[str, dict[str, float]] = {
         "diff_cert_broad":   -0.08,
         "cert_san_match":     0.08,   # Cert explicitly covers SNI — consistent with a genuine web deployment
         "cert_san_mismatch": -0.10,   # Cert mismatch weakens "ordinary site" reading
+        "ocsp_stapled":       0.04,   # OCSP stapling is a minor positive signal
+        "web_presence":       0.06,   # Web assets found — consistent with a real website
+        "rdns_match":         0.04,   # PTR matches domain — consistent with genuine deployment
+        "options_normal":     0.02,   # Normal OPTIONS handling
     },
 }
 
@@ -188,6 +205,19 @@ def _translate_reason(text: str, lang: str = "en") -> str:
         "weak gRPC hint combined with other anomalies": "слабый признак gRPC в сочетании с другими аномалиями",
         "combined foreign-SNI + no-SNI acceptance widens surface": "комбинация foreign-SNI + no-SNI расширяет поверхность",
         "broad SNI behavior appears alongside transport or web-profile anomalies": "широкое SNI-поведение наблюдается вместе с транспортными или веб-профильными аномалиями",
+        # supplementary probe reasons
+        "OCSP stapling configured": "настроен OCSP stapling",
+        "web assets found (robots.txt / favicon)": "найдены веб-ресурсы (robots.txt / favicon)",
+        "web assets present (robots.txt / favicon)": "присутствуют веб-ресурсы (robots.txt / favicon)",
+        "HTTP/3 advertised via Alt-Svc": "HTTP/3 рекламируется через Alt-Svc",
+        "HTTP/3 advertised via Alt-Svc — CDN-typical": "HTTP/3 рекламируется через Alt-Svc — характерно для CDN",
+        "PTR record matches target domain": "PTR-запись совпадает с целевым доменом",
+        "OPTIONS handled like a normal web server": "OPTIONS обрабатывается как у обычного веб-сервера",
+        "OPTIONS handled normally": "OPTIONS обрабатывается нормально",
+        "OPTIONS 200 without Allow header — proxy-like response": "OPTIONS 200 без заголовка Allow — ответ похожий на прокси",
+        "CDN or major cloud network ASN": "ASN CDN или крупного облачного провайдера",
+        "VPS or hosting network ASN": "ASN VPS или хостингового провайдера",
+        "real web assets found — speaks against a pure camouflage relay": "найдены реальные веб-ресурсы — свидетельствует против чистого камуфлирующего ретранслятора",
     }
     return mapping.get(text, text)
 
@@ -435,6 +465,27 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
     h2_settings_normal = _sev(findings, "h2_settings") == "ok"
     h2_settings_unusual = _sev(findings, "h2_settings") == "notice"
 
+    # supplementary signals (individually weak, used in combination)
+    ocsp_stapled       = _sev(findings, "ocsp_stapling") == "ok"
+    web_presence_ok    = _sev(findings, "web_presence") == "ok"
+    alt_svc_h3         = _sev(findings, "alt_svc") == "ok"
+    rdns_match         = _sev(findings, "rdns") == "ok"
+    options_normal     = _sev(findings, "options_probe") == "ok"
+    options_proxy_like = _sev(findings, "options_probe") == "notice"
+
+    # ASN-based signals: parsed from the target.asn string already in the payload.
+    # These are heuristic — AS numbers and name substrings may change over time.
+    _asn = str(payload.get("target", {}).get("asn", "")).lower()
+    asn_cdn = any(x in _asn for x in (
+        "cloudflare", "fastly", "akamai", "as13335", "as54113", "as16625",
+        "as15169", "google", "as16509", "amazon", "as8075", "microsoft",
+    ))
+    asn_vps = any(x in _asn for x in (
+        "digitalocean", "vultr", "hetzner", "ovh", "linode", "as14061",
+        "as20473", "as24940", "as16276", "as63949", "namecheap", "as8560",
+        "ionos", "as21100",
+    ))
+
     strong_negative = sum([
         connect_rejected,
         not ws_exposed,
@@ -506,6 +557,20 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
             add(scores, "ordinary_web_front", W["h2_settings_normal"], "standard HTTP/2 settings profile")
         if h2_settings_unusual:
             add(scores, "ordinary_web_front", W["h2_settings_unusual"], against="unusual HTTP/2 settings — atypical for standard web servers")
+        if ocsp_stapled:
+            add(scores, "ordinary_web_front", W["ocsp_stapled"], "OCSP stapling configured")
+        if web_presence_ok:
+            add(scores, "ordinary_web_front", W["web_presence"], "web assets found (robots.txt / favicon)")
+        if alt_svc_h3:
+            add(scores, "ordinary_web_front", W["alt_svc_h3"], "HTTP/3 advertised via Alt-Svc")
+        if rdns_match:
+            add(scores, "ordinary_web_front", W["rdns_match"], "PTR record matches target domain")
+        if options_normal:
+            add(scores, "ordinary_web_front", W["options_normal"], "OPTIONS handled like a normal web server")
+        if options_proxy_like:
+            add(scores, "ordinary_web_front", W["options_proxy"], against="OPTIONS 200 without Allow header — proxy-like response")
+        if asn_cdn:
+            add(scores, "ordinary_web_front", W["asn_cdn"], "CDN or major cloud network ASN")
 
     def _score_broad_tls_front() -> None:
         if not (mode == "tcp" and web_ok and public_cert):
@@ -532,6 +597,8 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
             add(scores, "broad_tls_front", W["very_normal_web"], against="very normal web profile overall")
         if strong_negative >= 5:
             add(scores, "broad_tls_front", W["no_indicators"], against="lack of direct tunnel indicators")
+        if asn_vps:
+            add(scores, "broad_tls_front", W["asn_vps"], "VPS or hosting network ASN")
 
     def _score_cdn_front() -> None:
         edge_banner = _obs(findings, "headers").lower()
@@ -552,6 +619,10 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
             add(scores, "cdn_or_reverse_proxy_front", W["redirect_ok"], "redirect-heavy edge-like entry behavior")
         if ws_exposed or grpc_exposed or grpc_strict_exposed or connect_accepted:
             add(scores, "cdn_or_reverse_proxy_front", W["transport_exposed"], against="transport/proxy exposure is less typical for a plain CDN edge")
+        if asn_cdn:
+            add(scores, "cdn_or_reverse_proxy_front", W["asn_cdn"], "CDN or major cloud network ASN")
+        if alt_svc_h3:
+            add(scores, "cdn_or_reverse_proxy_front", W["alt_svc_h3"], "HTTP/3 advertised via Alt-Svc — CDN-typical")
 
     def _score_tls_camouflage_relay() -> None:
         if mode != "tcp":
@@ -585,6 +656,10 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
             add(scores, "tls_camouflage_relay", W["cert_san_mismatch"], "certificate does not cover the probed SNI — possible shared/default cert")
         if h2_settings_unusual:
             add(scores, "tls_camouflage_relay", W["h2_settings_unusual"], "unusual HTTP/2 settings profile")
+        if asn_vps:
+            add(scores, "tls_camouflage_relay", W["asn_vps"], "VPS or hosting network ASN")
+        if web_presence_ok:
+            add(scores, "tls_camouflage_relay", W["web_presence"], against="real web assets found — speaks against a pure camouflage relay")
 
     def _score_default_cert_tls_front() -> None:
         if not (mode == "tcp" and web_ok and (foreign_open or nosni_open)):
@@ -697,6 +772,14 @@ def infer_payload(payload: dict[str, Any]) -> dict[str, Any]:
             add(scores, "no_clear_tunnel_evidence", W["cert_san_match"], "certificate explicitly covers the probed SNI")
         if cert_san_mismatch:
             add(scores, "no_clear_tunnel_evidence", W["cert_san_mismatch"], against="certificate does not cover the probed SNI")
+        if ocsp_stapled:
+            add(scores, "no_clear_tunnel_evidence", W["ocsp_stapled"], "OCSP stapling configured")
+        if web_presence_ok:
+            add(scores, "no_clear_tunnel_evidence", W["web_presence"], "web assets present (robots.txt / favicon)")
+        if rdns_match:
+            add(scores, "no_clear_tunnel_evidence", W["rdns_match"], "PTR record matches target domain")
+        if options_normal:
+            add(scores, "no_clear_tunnel_evidence", W["options_normal"], "OPTIONS handled normally")
 
     # ── Run all scorers ───────────────────────────────────────
     _score_ordinary_web_front()

@@ -209,7 +209,7 @@ print_notes_and_confidence() {
 }
 
 run_tcp() {
-  local host="$1" port="$2" sni="$3"
+  local host="$1" port="$2" sni="$3" ip="${4:-}"
   [[ "$OUTPUT_MODE" == "text" ]] && printf "%b\n\n" "${C}  ══ TCP / TLS INSPECTION ${DIM}══════════════════════════════════${NC}"
 
   local nmap_line
@@ -222,8 +222,29 @@ run_tcp() {
     add_finding "port_scan" "reachability" "Port scan" "risk" "port closed or filtered" "Target is not reachable over TCP on this port." "reachability" 0
   fi
 
+  # Reverse DNS: PTR record for the resolved IP.
+  # A PTR that matches the target domain is a mild positive signal (genuine web deployments
+  # usually configure it). Generic VPS hostnames (e.g. static.123.clients.hetzner.com) are
+  # a mild negative signal. If no PTR exists the probe is skipped silently.
+  if [[ -n "$ip" ]] && ! is_ip_literal "$host"; then
+    local ptr
+    ptr=$(dig +short -x "$ip" 2>/dev/null | head -1 | sed 's/\.$//' | tr -d '\r') || ptr=""
+    if [[ -n "$ptr" ]]; then
+      # Extract second-level domain from host for a loose match (sub.example.com → example.com)
+      local sld
+      sld=$(echo "$host" | awk -F'.' 'NF>=2{print $(NF-1)"."$NF}')
+      if echo "$ptr" | grep -qiF "$sld"; then
+        add_finding "rdns" "camouflage" "Reverse DNS" "ok" "PTR=${ptr}" \
+          "PTR record matches the target domain — consistent with a genuine web deployment." "camouflage" 2
+      else
+        add_finding "rdns" "camouflage" "Reverse DNS" "notice" "PTR=${ptr}" \
+          "PTR exists but does not match target domain — generic hosting or separate DNS management." "camouflage" 1
+      fi
+    fi
+  fi
+
   local tls_raw cert_raw cn issuer_o not_after days_left=0 tls_ver cipher alpn
-  tls_raw=$(echo | timeout "$TIMEOUT" openssl s_client -connect "${host}:${port}" -servername "$sni" -alpn "h2,http/1.1" 2>&1 | tr -d '\000') || tls_raw=""
+  tls_raw=$(echo | timeout "$TIMEOUT" openssl s_client -connect "${host}:${port}" -servername "$sni" -alpn "h2,http/1.1" -status 2>&1 | tr -d '\000') || tls_raw=""
   cert_raw=$(echo "$tls_raw" | openssl x509 -noout -subject -issuer -dates 2>/dev/null) || cert_raw=""
   cn=$(echo "$cert_raw" | grep subject | sed 's/.*CN *= *//' | sed 's/[,\/].*//')
   issuer_o=$(echo "$cert_raw" | grep issuer | sed 's/.*O *= *//' | sed 's/[,\/].*//')
@@ -277,6 +298,21 @@ run_tcp() {
       add_finding "cert_san" "camouflage" "Cert SAN match" "ok" "SNI=${sni} covered by cert" "Certificate explicitly covers the target SNI — expected for a genuine web deployment." "camouflage" 2
     else
       add_finding "cert_san" "camouflage" "Cert SAN match" "notice" "SNI=${sni} not in cert (CN=${cn})" "Certificate does not cover the probed SNI — may indicate a shared, default, or fronted cert." "camouflage" 0
+    fi
+  fi
+
+  # OCSP stapling: reuses tls_raw from the main handshake (-status flag was passed above).
+  # Stapling is typical of well-configured HTTPS services; its absence is a mild signal only
+  # (many real sites do not configure it), so we never emit "risk" here.
+  if [[ -n "$cn" ]]; then
+    local ocsp_ok=0
+    printf "%s" "$tls_raw" | grep -q "OCSP Response Status: successful" && ocsp_ok=1 || true
+    if [[ $ocsp_ok -eq 1 ]]; then
+      add_finding "ocsp_stapling" "camouflage" "OCSP stapling" "ok" "OCSP stapled" \
+        "OCSP stapling is typical of well-configured public HTTPS services." "camouflage" 2
+    else
+      add_finding "ocsp_stapling" "camouflage" "OCSP stapling" "notice" "not stapled" \
+        "OCSP not stapled; many legitimate sites skip this — weak signal on its own." "camouflage" 1
     fi
   fi
 
@@ -387,6 +423,19 @@ run_tcp() {
     add_finding "headers" "camouflage" "Response headers" "notice" "no useful Server header" "Header profile is sparse; camouflage signal is limited." "camouflage" 1
   fi
 
+  # Alt-Svc header — extracted from the same root_headers fetch, no extra connection.
+  # h3= in Alt-Svc is a strong indicator of CDN or modern web infrastructure.
+  local alt_svc_hdr
+  alt_svc_hdr=$(printf "%s" "$root_headers" | grep -i '^Alt-Svc:' | head -1 \
+    | sed 's/[Aa]lt-[Ss]vc:[[:space:]]*//' | tr -d '\r') || alt_svc_hdr=""
+  if echo "$alt_svc_hdr" | grep -qi 'h3='; then
+    add_finding "alt_svc" "camouflage" "Alt-Svc (HTTP/3)" "ok" "${alt_svc_hdr:0:42}" \
+      "Server advertises HTTP/3 via Alt-Svc — typical of CDNs and modern web deployments." "camouflage" 2
+  elif [[ -n "$alt_svc_hdr" ]]; then
+    add_finding "alt_svc" "camouflage" "Alt-Svc" "notice" "${alt_svc_hdr:0:42}" \
+      "Alt-Svc present but without h3 — non-standard or partial configuration." "camouflage" 1
+  fi
+
   # ALPN probe: use the *negotiated* ALPN from the TLS handshake (already in $alpn)
   # as the primary signal. curl --http2 / --http1.1 are used only to verify that
   # HTTP actually works over each version, not to infer what was negotiated.
@@ -491,6 +540,15 @@ run_tcp() {
     *) add_finding "http_connect" "exposure" "HTTP CONNECT" "notice" "CONNECT returned ${connect_code}" "Behavior is not clearly proxy-like, but not strongly normal either." "exposure" 1 ;;
   esac
 
+  # Web asset presence: probe /robots.txt and /favicon.ico.
+  # Real websites almost always have at least one; minimal proxy stubs typically have neither.
+  probe_web_presence "$host" "$port"
+
+  # HTTP OPTIONS method behaviour.
+  # A normal web server returns 405 (or 200 + Allow header). A pass-through proxy often
+  # returns 200 without any Allow header, which is a mild proxy-like signal.
+  probe_options "$host" "$port"
+
   probe_h2_settings "$host" "$port" "$sni"
 }
 
@@ -532,6 +590,53 @@ probe_h2_settings() {
 
   local score_val=2; [[ "$verdict" == "notice" ]] && score_val=1
   add_finding "h2_settings" "camouflage" "HTTP/2 settings" "$verdict" "$detail" "$impact" "camouflage" "$score_val"
+}
+
+probe_web_presence() {
+  local host="$1" port="$2"
+  local robots_code favicon_code
+  robots_code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 3 \
+    "https://${host}:${port}/robots.txt" 2>/dev/null) || robots_code="000"
+  favicon_code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 3 \
+    "https://${host}:${port}/favicon.ico" 2>/dev/null) || favicon_code="000"
+  local detail="robots.txt(${robots_code}) favicon.ico(${favicon_code})"
+  if [[ "$robots_code" == "200" || "$favicon_code" == "200" ]]; then
+    add_finding "web_presence" "camouflage" "Web assets" "ok" "$detail" \
+      "At least one common web asset exists — consistent with a real website." "camouflage" 2
+  else
+    add_finding "web_presence" "camouflage" "Web assets" "notice" "$detail" \
+      "No common web assets found — typical of a minimal-stub front or a bare server." "camouflage" 1
+  fi
+}
+
+probe_options() {
+  local host="$1" port="$2"
+  local opts_resp opts_code opts_allow
+  opts_resp=$(curl -sk -D - -o /dev/null -X OPTIONS --max-time 3 \
+    "https://${host}:${port}/" 2>/dev/null) || opts_resp=""
+  opts_code=$(printf "%s" "$opts_resp" | head -1 | awk '{print $2}')
+  opts_allow=$(printf "%s" "$opts_resp" | grep -i '^Allow:' | head -1 \
+    | sed 's/[Aa]llow:[[:space:]]*//' | tr -d '\r') || opts_allow=""
+  case "$opts_code" in
+    405|501)
+      add_finding "options_probe" "camouflage" "HTTP OPTIONS" "ok" "OPTIONS → ${opts_code}" \
+        "Server correctly refuses OPTIONS — matches ordinary web server behavior." "camouflage" 2
+      ;;
+    200)
+      if [[ -n "$opts_allow" ]]; then
+        add_finding "options_probe" "camouflage" "HTTP OPTIONS" "ok" \
+          "OPTIONS → 200 Allow: ${opts_allow:0:24}" \
+          "Server returns a proper Allow header — web-server-like behavior." "camouflage" 2
+      else
+        add_finding "options_probe" "camouflage" "HTTP OPTIONS" "notice" \
+          "OPTIONS → 200 (no Allow header)" \
+          "OPTIONS returns 200 without Allow — possible proxy pass-through." "camouflage" 1
+      fi
+      ;;
+    *)
+      # Non-standard or no response — not meaningful enough to report
+      ;;
+  esac
 }
 
 run_udp() {
@@ -713,7 +818,7 @@ main() {
 
   require_cmds nmap openssl curl nc dig getent python3 jq
   print_banner "$host" "$port" "TCP / TLS" "$ip" "$asn" "$sni"
-  run_tcp "$host" "$port" "$sni"
+  run_tcp "$host" "$port" "$sni" "$ip"
 
   if [[ "$OUTPUT_MODE" == "json" ]]; then
     local cert_extracted=0
